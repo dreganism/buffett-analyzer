@@ -1,0 +1,26 @@
+{
+  "ticker": "KO",
+  "sector": "Consumer Staples",
+  "industry": "Beverages - Non-Alcoholic",
+  "financials": {
+    "net_income": 9500,
+    "depreciation_amortization": 1800,
+    "capex_total": 1500,
+    "sales": 44000,
+    "ppe_net": 10000,
+    "working_capital": 6000,
+    "retained_earnings_bs": 38000,
+    "ebit": 12000,
+    "equity_mkt_value": 260000,
+    "total_assets": 95000,
+    "total_liabilities": 52000
+  },
+  "investees": [
+    {
+      "name": "BottlerCo",
+      "ownership_pct": 0.25,
+      "net_income": 800,
+      "dividends_received": 300
+    }
+  ]
+}
