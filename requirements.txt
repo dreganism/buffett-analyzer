@@ -1,8 +1,52 @@
-streamlit
-pandas
-numpy
-yfinance
-matplotlib
-scipy
-reportlab
-pytest
+# Buffett Analyzer - Complete Requirements
+# Core dependencies for financial analysis and web interface
+
+# Web Framework
+# streamlit>=1.28.0
+streamlit>=1.32
+
+# Data Processing & Analysis
+pandas>=1.5.0
+numpy>=1.24.0
+
+# Financial Data APIs
+yfinance>=0.2.20
+
+# PDF Generation & Reports
+reportlab>=4.0.4
+
+# AI Integration (ChatGPT)
+openai>=1.30.0
+
+# Environment & Configuration
+python-dotenv>=1.0.1
+
+# Optional: Enhanced Data Processing
+# Uncomment if you need additional data manipulation capabilities
+# openpyxl>=3.1.0          # Excel file support
+# xlsxwriter>=3.1.0        # Excel writing
+# requests>=2.31.0         # HTTP requests (usually included with yfinance)
+
+# Optional: Advanced Analytics
+# Uncomment if you plan to add charting or advanced analysis
+# matplotlib>=3.7.0        # Basic plotting
+# plotly>=5.15.0          # Interactive charts
+# scipy>=1.11.0           # Scientific computing
+
+# Optional: Development & Testing
+# Uncomment for development environment
+# pytest>=7.4.0           # Testing framework
+# black>=23.0.0           # Code formatting
+# flake8>=6.0.0           # Code linting
+
+# Optional: Database Support
+# Uncomment if you plan to add database functionality
+# sqlalchemy>=2.0.0       # Database ORM
+# sqlite3                 # Built-in, no install needed
+
+# Version Compatibility Notes:
+# - Python 3.8+ required for all dependencies
+# - streamlit 1.28.0+ recommended for latest features
+# - openai 1.0.0+ required for new API format
+# - pandas 1.5.0+ for better performance and features
+# - yfinance 0.2.20+ for latest Yahoo Finance compatibility
