@@ -24,12 +24,15 @@ import streamlit as st
 
 from report import export_pdf
 
+# Add this import line after your existing imports
+from chatgpt_integration import ChatGPTIntegration, render_chatgpt_modal, add_chatgpt_trigger_button
+from openai_client import quick_ping, get_openai_client, _get_api_key  # _get_api_key only if you want to show masked
 
 # -----------------------------
 # ---------- GLOSSARY ----------
 # -----------------------------
 GLOSSARY: Dict[str, str] = {
-    "circle_of_competence": "Your ‘lane’—businesses and industries you truly understand. Buffett avoids investing outside this circle.",
+    "circle_of_competence": "Your 'lane'—businesses and industries you truly understand. Buffett avoids investing outside this circle.",
     "whitelist": "Sectors/industries you explicitly prefer to evaluate. Matching sector OR industry passes the gate.",
     "blacklist": "Sectors/industries to exclude (e.g., pre-revenue biotech, SPACs). Matching entries fail the gate.",
     "complexity_flags": "Quick exclusions for tricky categories like 'pre-revenue', 'binary-fda', 'exploration-only', 'crypto-miner'.",
@@ -38,7 +41,7 @@ GLOSSARY: Dict[str, str] = {
     "maint_dep_simple": "Assume Maintenance CapEx ≈ D&A. Simple and conservative when history is limited.",
     "maint_greenwald": "Greenwald PPE/Sales proxy: Maintenance CapEx = Total CapEx − Growth CapEx (estimated from PPE/Sales and sales growth).",
     "weights_section": "Weights for components of the Capital Preservation Score. We normalize internally.",
-    "w_z": "Importance of Altman Z (or Z’). Higher Z suggests lower bankruptcy risk.",
+    "w_z": "Importance of Altman Z (or Z'). Higher Z suggests lower bankruptcy risk.",
     "w_mdd": "Importance of Max Drawdown (inverted). Lower historical drawdown → higher score.",
     "w_vol": "Importance of Annualized Volatility (inverted). Lower volatility → higher score.",
     "weights_autonorm": "Weights auto-normalize so their sum acts like 1.0.",
@@ -62,7 +65,7 @@ GLOSSARY: Dict[str, str] = {
     "total_assets": "Total assets on the balance sheet.",
     "total_liabilities": "Total liabilities on the balance sheet.",
     "investee_json": "Optional list for Look-Through Earnings: [{name, ownership_pct (0..1), net_income, dividends_received}].",
-    "altman_z": "Altman Z (or Z’) combines five ratios to assess bankruptcy risk (Distress/Gray/Safe).",
+    "altman_z": "Altman Z (or Z') combines five ratios to assess bankruptcy risk (Distress/Gray/Safe).",
     "max_drawdown": "Worst peak-to-trough price decline over the period (positive fraction; 0.42 = −42%).",
     "volatility": "Annualized standard deviation of daily returns (10Y).",
     "capital_preservation": "Blend of Z-zone, inverse drawdown, and inverse volatility, weighted by your sliders.",
@@ -72,10 +75,30 @@ GLOSSARY: Dict[str, str] = {
 def H(key: str) -> str:
     return GLOSSARY.get(key, "")
 
+# ------- GPT INTEGRATION -------
+def get_current_company_data(ticker: str, oe_final: float, lt: float, z: float, zone: str, 
+                           score_cprs: float, buffett_score: float, net_income: float, 
+                           sales: float) -> Dict:
+    """Compile current company data for ChatGPT context."""
+    return {
+        "ticker": ticker,
+        "net_income": fmt_money_short(net_income),
+        "sales": fmt_money_short(sales),
+        "owner_earnings": fmt_money_short(oe_final),
+        "look_through_earnings": fmt_money_short(lt),
+        "altman_z": f"{z:.2f} ({zone})",
+        "capital_preservation": f"{score_cprs * 100:.1f}/100",
+        "buffett_score": f"{buffett_score:.1f}/100",
+        "raw_net_income": net_income,
+        "raw_sales": sales,
+        "raw_owner_earnings": oe_final,
+        "raw_look_through": lt,
+        "raw_altman_z": z,
+        "raw_capital_preservation": score_cprs,
+        "raw_buffett_score": buffett_score
+    }
 
-# -----------------------------
 # ------- FORMAT HELPERS -------
-# -----------------------------
 def fmt_money_short(value: Optional[float], decimals: int = 1) -> str:
     """Short-scale USD formatter: $1.2K / $3.4M / $5.6B / $1.2T; handles negatives & small numbers."""
     try:
@@ -167,20 +190,61 @@ def render_data_quality_flags():
 @st.cache_data
 def load_prices(ticker: str, years: int = 10) -> pd.Series:
     """Fetch daily prices and return a 1-D float Series (prefer 'Close')."""
-    data = fetch_prices_daily(ticker, years=years)
-    if isinstance(data, pd.DataFrame):
-        if "Close" in data.columns:
-            s = data["Close"]
+    try:
+        data = fetch_prices_daily(ticker, years=years)
+        
+        # Handle case where fetch_prices_daily returns None or empty
+        if data is None:
+            return pd.Series(dtype=float, name="price")
+        
+        # Handle case where fetch_prices_daily returns a DataFrame
+        if isinstance(data, pd.DataFrame):
+            if data.empty:
+                return pd.Series(dtype=float, name="price")
+            
+            if "Close" in data.columns:
+                s = data["Close"]
+            else:
+                # Try to get first numeric column
+                num = data.select_dtypes(include=[np.number])
+                if not num.empty:
+                    s = num.iloc[:, 0]
+                else:
+                    s = data.iloc[:, 0]
+            
+            # Ensure s is a Series
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0] if not s.empty else pd.Series(dtype=float)
+            
+            # Convert to numeric and clean
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            s.name = "price"
+            return s
+        
+        # Handle case where it's already a Series
+        elif isinstance(data, pd.Series):
+            if data.empty:
+                return pd.Series(dtype=float, name="price")
+            
+            s = pd.to_numeric(data, errors="coerce").dropna()
+            s.name = "price"
+            return s
+        
+        # Handle other cases (list, numpy array, etc.)
         else:
-            num = data.select_dtypes(include=[np.number])
-            s = (num.iloc[:, 0] if not num.empty else data.iloc[:, 0])
-        s = pd.to_numeric(s, errors="coerce").dropna()
-        s.name = "price"
-        return s
-    # Already a Series or list-like
-    s = pd.to_numeric(pd.Series(data), errors="coerce").dropna()
-    s.name = "price"
-    return s
+            try:
+                # Convert to Series first
+                s = pd.Series(data) if not isinstance(data, pd.Series) else data
+                s = pd.to_numeric(s, errors="coerce").dropna()
+                s.name = "price"
+                return s
+            except Exception:
+                return pd.Series(dtype=float, name="price")
+                
+    except Exception as e:
+        print(f"Error in load_prices for {ticker}: {e}")
+        # Return empty Series on any error
+        return pd.Series(dtype=float, name="price")
 
 def pct_returns(prices: pd.Series) -> pd.Series:
     """Return simple percentage returns as a Series."""
@@ -516,7 +580,15 @@ def main():
     st.set_page_config(page_title="Buffett Analyzer — Extended", layout="wide")
     init_defaults()  # MUST run before any widgets are created
 
+    # Initialize ChatGPT integration - MOVED INSIDE main()
+    if "chatgpt_integration" not in st.session_state:
+        st.session_state["chatgpt_integration"] = ChatGPTIntegration()
+    
+    chat_integration = st.session_state["chatgpt_integration"]
+
     st.title("Buffett Analyzer")
+    # Add ChatGPT trigger button
+    add_chatgpt_trigger_button()
 
     # Show success toast once after a fetch
     if st.session_state.pop("__fetched_ok", False):
@@ -622,7 +694,7 @@ def main():
         intraday = fetch_intraday_1m(ticker)
         if not intraday.empty:
             try:
-                last_px = float(intraday["Close"].dropna().iloc[-1])
+                last_px = intraday["Close"].dropna().iloc[-1].item()
                 st.metric("Latest Price (1m)", fmt_money_price(last_px))
             except Exception:
                 pass
@@ -808,14 +880,31 @@ def main():
             with open(pdf_file, "rb") as f:
                 st.download_button("Download PDF", f, file_name=f"{ticker}_report.pdf", mime="application/pdf")
 
+    # MOVED INSIDE main() - Compile company data for ChatGPT context
+    company_data = get_current_company_data(
+        ticker=ticker,
+        oe_final=oe_final,
+        lt=lt,
+        z=z,
+        zone=zone,
+        score_cprs=score_cprs,
+        buffett_score=buffett_score,
+        net_income=net_income,
+        sales=sales
+    )
+
+    # MOVED INSIDE main() - Render ChatGPT modal if active
+    render_chatgpt_modal(chat_integration, ticker, company_data)
+
+    # MOVED INSIDE main() - Notes caption
     st.caption("""
-**Notes**  
-• Owner Earnings per Buffett (1986): NI + D&A (+non-cash) − Maintenance CapEx (optionally adjust for ΔWC).  
-• Look-Through Earnings per Buffett (1991): add retained earnings of investees pro-rata (after tax).  
-• Capital Preservation blends Altman Z (or Z’), Max Drawdown, and volatility.  
-• Contrarian overlay is optional and user-weighted.  
-• Yahoo fundamentals are best-effort; validate before making decisions.
-""")
+    **Notes**  
+    • Owner Earnings per Buffett (1986): NI + D&A (+non-cash) − Maintenance CapEx (optionally adjust for ΔWC).  
+    • Look-Through Earnings per Buffett (1991): add retained earnings of investees pro-rata (after tax).  
+    • Capital Preservation blends Altman Z (or Z'), Max Drawdown, and volatility.  
+    • Contrarian overlay is optional and user-weighted.  
+    • Yahoo fundamentals are best-effort; validate before making decisions.
+    """)
 
 if __name__ == "__main__":
     main()
