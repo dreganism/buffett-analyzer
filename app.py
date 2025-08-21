@@ -138,12 +138,13 @@ def fmt_pct(frac: Optional[float], decimals: int = 1) -> str:
 
 # ---- INPUT WIDGET HELPERS (pretty display under the control) ----
 def money_number_input(label: str, key: str, step: float, help: str = "") -> float:
-    """Number input for money-like fields, with a readable short-scale + full-comma display underneath."""
+    """Number input for money-like fields."""
     val = st.number_input(label, step=step, key=key, help=help)
-    try:
-        st.caption(f"{fmt_money_short(val, 2)}  ·  {val:,.0f}")
-    except Exception:
-        pass
+    # Removed the user-friendly caption display
+    # try:
+    #     st.caption(f"{fmt_money_short(val, 2)}  ·  {val:,.0f}")
+    # except Exception:
+    #     pass
     return val
 
 # ---- Data quality flags (visual) --------------------------------
