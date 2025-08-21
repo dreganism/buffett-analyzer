@@ -1,5 +1,5 @@
 # chatgpt_integration.py
-# OpenAI API integration for Buffett Analyzer
+# OpenAI / Azure OpenAI integration for Buffett Analyzer
 # Provides ChatGPT functionality with PDF export capabilities
 
 from __future__ import annotations
@@ -25,18 +25,28 @@ from openai._exceptions import (
     BadRequestError,
 )
 
+# Azure OpenAI (same package, separate client class)
+try:
+    from openai import AzureOpenAI
+    _HAS_AZURE = True
+except Exception:
+    AzureOpenAI = None  # type: ignore
+    _HAS_AZURE = False
+
 # -----------------------------
 # ----- dotenv + helpers -------
 # -----------------------------
-# Load nearest .env (walks up from CWD). Non-destructive (won't override existing env vars).
 _ENV_PATH = find_dotenv(usecwd=True)
 load_dotenv(_ENV_PATH, override=False)
 
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 def _get_env_api_key() -> Optional[str]:
-    """Priority: environment -> Streamlit secrets."""
+    """
+    Priority: OPENAI_API_KEY -> st.secrets -> AZURE_OPENAI_API_KEY
+    (Azure path only used if Azure endpoint is configured)
+    """
     key = os.getenv("OPENAI_API_KEY")
     if key:
         return key.strip()
@@ -46,7 +56,18 @@ def _get_env_api_key() -> Optional[str]:
             return str(key).strip()
     except Exception:
         pass
+
+    # Only return Azure key if we ALSO see an endpoint
+    if os.getenv("AZURE_OPENAI_ENDPOINT"):
+        ak = os.getenv("AZURE_OPENAI_API_KEY")
+        if ak:
+            return ak.strip()
     return None
+
+
+def _is_azure_mode() -> bool:
+    """We consider 'azure mode' enabled if endpoint + key are present."""
+    return bool(os.getenv("AZURE_OPENAI_ENDPOINT") and os.getenv("AZURE_OPENAI_API_KEY"))
 
 
 def _mask(s: Optional[str], keep: int = 4) -> str:
@@ -61,33 +82,83 @@ def _mask(s: Optional[str], keep: int = 4) -> str:
 # -----------------------------
 @dataclass
 class ChatMessage:
-    """Represents a single chat message."""
     role: str  # 'user' or 'assistant'
     content: str
     timestamp: datetime
 
 
 class ChatGPTIntegration:
-    """Handles OpenAI API integration and chat management."""
+    """Handles OpenAI / Azure OpenAI integration and chat management."""
 
     def __init__(self, api_key: Optional[str] = None, model: str = DEFAULT_MODEL):
-        # Prefer provided key; else from env/secrets
         self.api_key: Optional[str] = (api_key or _get_env_api_key())
         self.model: str = model
-        self.client: Optional[OpenAI] = OpenAI(api_key=self.api_key) if self.api_key else None
+        self.azure_mode: bool = _is_azure_mode()
+        self.client = self._build_client()
         self.chat_history: List[ChatMessage] = []
 
     # ---- configuration ----
+    def _build_client(self):
+        if not self.api_key:
+            return None
+
+        if self.azure_mode:
+            if not _HAS_AZURE:
+                raise RuntimeError(
+                    "AzureOpenAI client not available. Upgrade 'openai' package to 1.40+."
+                )
+            endpoint = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()
+            api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-06-01").strip()
+            return AzureOpenAI(
+                api_key=self.api_key,
+                azure_endpoint=endpoint,
+                api_version=api_version,
+            )
+        else:
+            return OpenAI(api_key=self.api_key)
+
     def is_configured(self) -> bool:
         return bool(self.api_key)
 
     def set_api_key(self, key: str):
         """Set/replace key at runtime and rebuild client."""
         self.api_key = key.strip() if key else None
-        self.client = OpenAI(api_key=self.api_key) if self.api_key else None
+        # If user pasted a standard OpenAI key (starts with sk-), prefer non-Azure mode
+        if self.api_key and self.api_key.startswith("sk-"):
+            self.azure_mode = False
+        # If Azure env is set, force Azure mode
+        if _is_azure_mode():
+            self.azure_mode = True
+        self.client = self._build_client()
+
+    # ---- diagnostics ----
+    def _hc_prompt(self) -> List[Dict[str, str]]:
+        return [
+            {"role": "system", "content": "You are a health check."},
+            {"role": "user", "content": "Reply with the single word: pong."},
+        ]
+
+    def _hc_standard(self, model: str) -> str:
+        resp = self.client.chat.completions.create(
+            model=model,
+            messages=self._hc_prompt(),
+            max_tokens=3,
+            temperature=0,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
+    def _hc_azure(self, deployment: str) -> str:
+        # In Azure, the “model” param is the deployment name
+        resp = self.client.chat.completions.create(
+            model=deployment,
+            messages=self._hc_prompt(),
+            max_tokens=3,
+            temperature=0,
+        )
+        return (resp.choices[0].message.content or "").strip()
 
     def health_check(self, model: Optional[str] = None) -> str:
-        """Tiny test call to confirm auth + model access."""
+        """Confirm auth + model/deployment access for the active mode."""
         if not self.api_key:
             src = "env/secrets" if _get_env_api_key() else "none"
             return f"API key not set (loader saw source: {src})."
@@ -95,26 +166,34 @@ class ChatGPTIntegration:
         if not self.client:
             return "Client not initialized. Try re-entering the key."
 
-        model = model or self.model
         try:
-            resp = self.client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": "You are a health check."},
-                    {"role": "user", "content": "Reply with the single word: pong."},
-                ],
-                max_tokens=3,
-                temperature=0,
-            )
-            txt = (resp.choices[0].message.content or "").strip()
-            if txt.lower() == "pong":
-                env_status = "yes" if _ENV_PATH else "no"
-                return f"OK (key={_mask(self.api_key)}, model={model}, .env found={env_status})"
-            return f"Connected, unexpected reply: {txt!r}"
+            if self.azure_mode:
+                deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", model or self.model).strip()
+                txt = self._hc_azure(deployment)
+                if txt.lower() == "pong":
+                    return (
+                        f"OK (Azure: key={_mask(self.api_key)}, "
+                        f"endpoint={os.getenv('AZURE_OPENAI_ENDPOINT')}, "
+                        f"deployment={deployment})"
+                    )
+                return f"Azure connected, unexpected reply: {txt!r}"
+            else:
+                chosen = model or self.model
+                txt = self._hc_standard(chosen)
+                if txt.lower() == "pong":
+                    env_status = "yes" if _ENV_PATH else "no"
+                    return f"OK (key={_mask(self.api_key)}, model={chosen}, .env found={env_status})"
+                return f"Connected, unexpected reply: {txt!r}"
+
         except AuthenticationError:
-            return f"Auth failed (key={_mask(self.api_key)}). Check OPENAI_API_KEY formatting/permissions."
-        except NotFoundError:
-            return f"Model '{model}' not found/authorized for this account."
+            return f"Auth failed (key={_mask(self.api_key)}). Check API key formatting/permissions."
+        except NotFoundError as e:
+            if self.azure_mode:
+                return (
+                    f"Azure deployment not found/authorized. "
+                    f"Set AZURE_OPENAI_DEPLOYMENT to your deployment name. ({e})"
+                )
+            return f"Model '{model or self.model}' not found/authorized. ({e})"
         except RateLimitError:
             return "Rate limit reached; try again later."
         except APIConnectionError:
@@ -126,7 +205,6 @@ class ChatGPTIntegration:
 
     # ---- system context ----
     def add_system_context(self, ticker: str, company_data: Dict) -> str:
-        """Create system context from current company analysis."""
         return (
             "You are an expert financial analyst assistant integrated into the Buffett Analyzer application.\n"
             f"The user is currently analyzing {ticker} with the following key metrics:\n\n"
@@ -155,37 +233,49 @@ class ChatGPTIntegration:
     ) -> str:
         """Get response from ChatGPT with company context (synchronous)."""
         if not self.client or not self.api_key:
-            return "OpenAI client not configured. Set OPENAI_API_KEY first."
+            return "OpenAI client not configured. Set OPENAI_API_KEY or Azure vars first."
 
-        model = model or self.model
         try:
             messages = [{"role": "system", "content": self.add_system_context(ticker, company_data)}]
-
-            # Include last up-to-6 messages for context
             recent = self.chat_history[-6:] if len(self.chat_history) > 6 else self.chat_history
             for msg in recent:
                 messages.append({"role": msg.role, "content": msg.content})
-
             messages.append({"role": "user", "content": user_message})
 
-            resp = self.client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
+            if self.azure_mode:
+                deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", model or self.model).strip()
+                resp = self.client.chat.completions.create(
+                    model=deployment,  # deployment name in Azure
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+            else:
+                chosen = model or self.model
+                resp = self.client.chat.completions.create(
+                    model=chosen,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                )
+
             assistant_message = (resp.choices[0].message.content or "").strip()
 
-            # Store messages in history
             self.chat_history.append(ChatMessage("user", user_message, datetime.now()))
             self.chat_history.append(ChatMessage("assistant", assistant_message, datetime.now()))
 
             return assistant_message
 
         except AuthenticationError:
-            return "Authentication failed. Verify OPENAI_API_KEY."
-        except NotFoundError:
-            return f"Model '{model}' not available to this account."
+            return "Authentication failed. Verify API key (and Azure endpoint/deployment if applicable)."
+        except NotFoundError as e:
+            if self.azure_mode:
+                return (
+                    "Azure deployment not available to this key. "
+                    "Check AZURE_OPENAI_DEPLOYMENT and access. "
+                    f"({e})"
+                )
+            return f"Model not available to this account. ({e})"
         except RateLimitError:
             return "Rate limit reached; please retry later."
         except APIConnectionError:
@@ -227,6 +317,10 @@ def render_chatgpt_modal(chat_integration: ChatGPTIntegration, ticker: str, comp
     if not st.session_state.get("show_chatgpt_modal", False):
         return
 
+    # --- reset chat input if requested (before widget is created) ---
+    if st.session_state.pop("_reset_chatgpt_input", False):
+        st.session_state.pop("chatgpt_input", None)
+
     # Basic CSS
     st.markdown(
         """
@@ -257,17 +351,18 @@ def render_chatgpt_modal(chat_integration: ChatGPTIntegration, ticker: str, comp
             st.rerun()
 
     # Config/status strip
+    backend = "Azure OpenAI" if chat_integration.azure_mode else "OpenAI"
     st.caption(
         f".env found: {'yes' if _ENV_PATH else 'no'} • "
-        f"Env/Secrets key present: {'yes' if bool(_get_env_api_key()) else 'no'} • "
+        f"Backend: {backend} • "
         f"Using key: {_mask(chat_integration.api_key)} • "
-        f"Model: {chat_integration.model}"
+        f"Model/Deployment: {chat_integration.model if not chat_integration.azure_mode else os.getenv('AZURE_OPENAI_DEPLOYMENT', chat_integration.model)}"
     )
 
-    # If not configured, let user paste a key
+    # If not configured, allow paste
     if not chat_integration.is_configured():
-        st.warning("⚠️ OpenAI API key not configured. Set `OPENAI_API_KEY` in your environment or paste it below.")
-        key_in = st.text_input("Enter OpenAI API Key", type="password", key="temp_api_key")
+        st.warning("⚠️ API key not configured. Set environment variables or paste a key below.")
+        key_in = st.text_input("Enter API Key", type="password", key="temp_api_key")
         cols = st.columns([1, 1, 2])
         with cols[0]:
             if st.button("Save key", key="save_openai_key"):
@@ -286,8 +381,7 @@ def render_chatgpt_modal(chat_integration: ChatGPTIntegration, ticker: str, comp
         if st.button("Health Check", key="health_check_keyed"):
             st.info(chat_integration.health_check())
     with hc_cols[1]:
-        # Allow on-the-fly model override
-        new_model = st.text_input("Model (optional)", value=chat_integration.model, key="chat_model_name")
+        new_model = st.text_input("Model/Deployment (optional)", value=chat_integration.model, key="chat_model_name")
         if new_model and new_model != chat_integration.model:
             chat_integration.model = new_model.strip()
 
@@ -322,12 +416,13 @@ def render_chatgpt_modal(chat_integration: ChatGPTIntegration, ticker: str, comp
             if user_input.strip():
                 with st.spinner("Getting AI analysis..."):
                     _ = chat_integration.get_chatgpt_response(user_input, ticker, company_data)
-                st.session_state["chatgpt_input"] = ""  # clear box
+                st.session_state["_reset_chatgpt_input"] = True
                 st.rerun()
 
     with btn_cols[1]:
         if st.button("Clear 🗑️", key="clear_chatgpt"):
             chat_integration.clear_chat_history()
+            st.session_state["_reset_chatgpt_input"] = True
             st.rerun()
 
     with btn_cols[2]:
@@ -355,7 +450,6 @@ def render_chatgpt_modal(chat_integration: ChatGPTIntegration, ticker: str, comp
                     st.success(f"✅ PDF report generated: {pdf_filename}")
                 except Exception as e:
                     st.error(f"Error creating PDF: {e}")
-                    # Fallback: text export
                     export_text = chat_integration.export_chat_to_text()
                     st.download_button(
                         "📥 Download Text (Fallback)",
