@@ -41,11 +41,6 @@ load_dotenv(_ENV_PATH, override=False)
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-# Global switch to surface debug/admin UI within the ChatGPT modal.
-# Keep this False in production; flip to True only when you want to see
-# header banner, env/key/model caption, health check and model override controls.
-SHOW_CHATGPT_DEBUG = False
-
 
 def _get_env_api_key() -> Optional[str]:
     """
@@ -317,24 +312,10 @@ class ChatGPTIntegration:
 # -----------------------------
 # --------- UI Modal ----------
 # -----------------------------
-def render_chatgpt_modal(
-    chat_integration: ChatGPTIntegration,
-    ticker: str,
-    company_data: Dict,
-    show_debug: Optional[bool] = None,
-):
-    """
-    Render the ChatGPT integration modal UI.
-
-    Hidden-by-default UI (header/banner, env/model caption, model override, health check)
-    can be enabled by passing show_debug=True, or by setting SHOW_CHATGPT_DEBUG=True at
-    module level. If show_debug is None, falls back to the module flag (False by default).
-    """
+def render_chatgpt_modal(chat_integration: ChatGPTIntegration, ticker: str, company_data: Dict):
+    """Render the ChatGPT integration modal UI."""
     if not st.session_state.get("show_chatgpt_modal", False):
         return
-
-    # Determine effective debug state
-    dbg = bool(SHOW_CHATGPT_DEBUG) if show_debug is None else bool(show_debug)
 
     # --- reset chat input if requested (before widget is created) ---
     if st.session_state.pop("_reset_chatgpt_input", False):
@@ -348,7 +329,7 @@ def render_chatgpt_modal(
         background: white; border: 2px solid #1f77b4; border-radius: 15px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.2); z-index: 1000; overflow: hidden; }
     .chatgpt-header { background: linear-gradient(135deg, #1f77b4, #1565c0); color: white;
-        padding: 14px 18px; margin: 0; font-weight: 600; font-size: 16px; display:flex; justify-content:space-between; align-items:center; }
+        padding: 14px 18px; margin: 0; font-weight: 600; font-size: 16px; }
     .chatgpt-content { padding: 14px 16px; max-height: 70vh; overflow-y: auto; }
     .chat-message { margin: 10px 0; padding: 10px 12px; border-radius: 10px; font-size: 14px; line-height: 1.4; }
     .user-message { background: #e3f2fd; border-left: 4px solid #2196f3; margin-left: 20px; }
@@ -360,27 +341,25 @@ def render_chatgpt_modal(
         unsafe_allow_html=True,
     )
 
-    # Header row (title visible only when debugging)
+    # Header row
     head_cols = st.columns([6, 1])
     with head_cols[0]:
-        header_title = "🤖 ChatGPT Financial Assistant" if dbg else ""
-        st.markdown(f'<div class="chatgpt-header">{header_title}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="chatgpt-header">🤖 ChatGPT Financial Assistant</div>', unsafe_allow_html=True)
     with head_cols[1]:
         if st.button("✕", key="close_chatgpt_modal", help="Close ChatGPT Assistant"):
             st.session_state["show_chatgpt_modal"] = False
             st.rerun()
 
-    # Debug/status strip (hidden when not debugging)
-    if dbg:
-        backend = "Azure OpenAI" if chat_integration.azure_mode else "OpenAI"
-        st.caption(
-            f".env found: {'yes' if _ENV_PATH else 'no'} • "
-            f"Backend: {backend} • "
-            f"Using key: {_mask(chat_integration.api_key)} • "
-            f"Model/Deployment: {chat_integration.model if not chat_integration.azure_mode else os.getenv('AZURE_OPENAI_DEPLOYMENT', chat_integration.model)}"
-        )
+    # Config/status strip
+    backend = "Azure OpenAI" if chat_integration.azure_mode else "OpenAI"
+    st.caption(
+        f".env found: {'yes' if _ENV_PATH else 'no'} • "
+        f"Backend: {backend} • "
+        f"Using key: {_mask(chat_integration.api_key)} • "
+        f"Model/Deployment: {chat_integration.model if not chat_integration.azure_mode else os.getenv('AZURE_OPENAI_DEPLOYMENT', chat_integration.model)}"
+    )
 
-    # If not configured, allow paste (this is always shown if needed)
+    # If not configured, allow paste
     if not chat_integration.is_configured():
         st.warning("⚠️ API key not configured. Set environment variables or paste a key below.")
         key_in = st.text_input("Enter API Key", type="password", key="temp_api_key")
@@ -391,27 +370,20 @@ def render_chatgpt_modal(
                     chat_integration.set_api_key(key_in.strip())
                     st.success("Key saved in memory for this session.")
                     st.rerun()
-        # Health check is also a debug/admin control; hide unless dbg
-        if dbg:
-            with cols[1]:
-                if st.button("Health Check", key="health_check_no_key"):
-                    st.info(chat_integration.health_check())
+        with cols[1]:
+            if st.button("Health Check", key="health_check_no_key"):
+                st.info(chat_integration.health_check())
         return
 
-    # Health check + model choice (debug/admin only)
-    if dbg:
-        hc_cols = st.columns([1, 1, 1])
-        with hc_cols[0]:
-            if st.button("Health Check", key="health_check_keyed"):
-                st.info(chat_integration.health_check())
-        with hc_cols[1]:
-            new_model = st.text_input(
-                "Model/Deployment (optional)",
-                value=chat_integration.model,
-                key="chat_model_name",
-            )
-            if new_model and new_model != chat_integration.model:
-                chat_integration.model = new_model.strip()
+    # Health check + model choice (optional)
+    hc_cols = st.columns([1, 1, 1])
+    with hc_cols[0]:
+        if st.button("Health Check", key="health_check_keyed"):
+            st.info(chat_integration.health_check())
+    with hc_cols[1]:
+        new_model = st.text_input("Model/Deployment (optional)", value=chat_integration.model, key="chat_model_name")
+        if new_model and new_model != chat_integration.model:
+            chat_integration.model = new_model.strip()
 
     st.markdown("#### Recent Conversation")
     if chat_integration.chat_history:
@@ -491,7 +463,7 @@ def render_chatgpt_modal(
 
 
 def add_chatgpt_trigger_button():
-    """Add the ChatGPT trigger button to the sidebar (kept for compatibility)."""
+    """Add the ChatGPT trigger button to the sidebar."""
     with st.sidebar:
         st.markdown("---")
         if st.button(

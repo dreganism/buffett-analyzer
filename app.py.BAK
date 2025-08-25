@@ -24,13 +24,9 @@ import streamlit as st
 
 from report import export_pdf
 
-# ChatGPT integration (auto-load modal)
-from chatgpt_integration import ChatGPTIntegration, render_chatgpt_modal
-# If you previously imported add_chatgpt_trigger_button, it's no longer needed.
-
-# Utility values and functions
-# NOTE: We hide ChatGPT debug/status UI elsewhere by keeping the debug flag False.
-SHOW_CHATGPT_DEBUG = False
+# Add this import line after your existing imports
+from chatgpt_integration import ChatGPTIntegration, render_chatgpt_modal, add_chatgpt_trigger_button
+from openai_client import quick_ping, get_openai_client, _get_api_key  # _get_api_key only if you want to show masked
 
 # -----------------------------
 # ---------- GLOSSARY ----------
@@ -140,17 +136,24 @@ def fmt_pct(frac: Optional[float], decimals: int = 1) -> str:
     except Exception:
         return "N/A"
 
-# ---- INPUT WIDGET HELPERS ----
+# ---- INPUT WIDGET HELPERS (pretty display under the control) ----
 def money_number_input(label: str, key: str, step: float, help: str = "") -> float:
     """Number input for money-like fields."""
     val = st.number_input(label, step=step, key=key, help=help)
+    # Removed the user-friendly caption display
+    # try:
+    #     st.caption(f"{fmt_money_short(val, 2)}  ·  {val:,.0f}")
+    # except Exception:
+    #     pass
     return val
 
-# ---- Data quality flags ----
+# ---- Data quality flags (visual) --------------------------------
 def render_data_quality_flags():
     """Show gentle warnings when scraped/mapped values look implausible."""
     s = st.session_state
     msgs: List[str] = []
+
+    # PP&E implausibly small vs Sales (e.g., parsing as $10K on a mega-cap)
     try:
         sales_val = float(s.get("inp_sales") or 0.0)
         ppe_val = float(s.get("inp_ppe") or 0.0)
@@ -161,6 +164,8 @@ def render_data_quality_flags():
             )
     except Exception:
         pass
+
+    # Retained earnings very negative while NI positive (labeling as 'Accumulated deficit' vs RE mixups)
     try:
         re_val = s.get("inp_re", None)
         ni_val = s.get("inp_net_income", None)
@@ -174,8 +179,10 @@ def render_data_quality_flags():
                 )
     except Exception:
         pass
+
     if msgs:
         st.warning("Potential data quality issues:")
+        # Render as a compact bullet list to avoid odd wrapping
         st.markdown("\n".join([f"- {m}" for m in msgs]))
 
 # -----------------------------
@@ -186,37 +193,58 @@ def load_prices(ticker: str, years: int = 10) -> pd.Series:
     """Fetch daily prices and return a 1-D float Series (prefer 'Close')."""
     try:
         data = fetch_prices_daily(ticker, years=years)
+        
+        # Handle case where fetch_prices_daily returns None or empty
         if data is None:
             return pd.Series(dtype=float, name="price")
+        
+        # Handle case where fetch_prices_daily returns a DataFrame
         if isinstance(data, pd.DataFrame):
             if data.empty:
                 return pd.Series(dtype=float, name="price")
+            
             if "Close" in data.columns:
                 s = data["Close"]
             else:
+                # Try to get first numeric column
                 num = data.select_dtypes(include=[np.number])
-                s = num.iloc[:, 0] if not num.empty else data.iloc[:, 0]
+                if not num.empty:
+                    s = num.iloc[:, 0]
+                else:
+                    s = data.iloc[:, 0]
+            
+            # Ensure s is a Series
             if isinstance(s, pd.DataFrame):
                 s = s.iloc[:, 0] if not s.empty else pd.Series(dtype=float)
+            
+            # Convert to numeric and clean
             s = pd.to_numeric(s, errors="coerce").dropna()
             s.name = "price"
             return s
+        
+        # Handle case where it's already a Series
         elif isinstance(data, pd.Series):
             if data.empty:
                 return pd.Series(dtype=float, name="price")
+            
             s = pd.to_numeric(data, errors="coerce").dropna()
             s.name = "price"
             return s
+        
+        # Handle other cases (list, numpy array, etc.)
         else:
             try:
+                # Convert to Series first
                 s = pd.Series(data) if not isinstance(data, pd.Series) else data
                 s = pd.to_numeric(s, errors="coerce").dropna()
                 s.name = "price"
                 return s
             except Exception:
                 return pd.Series(dtype=float, name="price")
+                
     except Exception as e:
         print(f"Error in load_prices for {ticker}: {e}")
+        # Return empty Series on any error
         return pd.Series(dtype=float, name="price")
 
 def pct_returns(prices: pd.Series) -> pd.Series:
@@ -256,6 +284,7 @@ def max_drawdown(prices: pd.Series) -> float:
         return float(drawdowns.max())
     except Exception:
         return float("nan")
+
 
 # -----------------------------
 # ---- OWNER EARNINGS ---------
@@ -344,6 +373,7 @@ def owner_earnings_adjusted(
     penalty = max(delta_wc, 0.0) if only_increases else float(delta_wc)
     return float(base_oe - penalty)
 
+
 # -----------------------------
 # ---- LOOK-THROUGH EARNINGS ---
 # -----------------------------
@@ -364,6 +394,7 @@ def look_through_earnings(
         retained = max(iv.net_income - iv.dividends_received, 0.0)
         lt += iv.ownership_pct * retained * (1.0 - tax_rate_on_retained)
     return float(lt)
+
 
 # -----------------------------
 # ---- ALTMAN Z & RISK --------
@@ -403,11 +434,14 @@ def capital_preservation_score(
     w_vol: float = 0.2,
 ) -> float:
     base = {"Distress": 0.2, "Gray": 0.6, "Safe": 0.9}.get(zone, 0.5)
+    # Defensive float coercion
     try:
         z_val = float(z_value)
     except Exception:
         z_val = 0.0
     z_norm = min(1.0, base * (1.0 + 0.05 * max(z_val, 0.0)))
+
+    # Coerce to float defensively
     try:
         mdd_val = float(mdd)
     except Exception:
@@ -416,17 +450,20 @@ def capital_preservation_score(
         vol_val = float(ann_vol)
     except Exception:
         vol_val = float("nan")
+
     if math.isnan(mdd_val):
         mdd_val = 0.5
     if math.isnan(vol_val):
         vol_val = 0.3
+
     mdd_norm = max(0.0, 1.0 - min(mdd_val, 0.8))
     vol_norm = max(0.0, 1.0 - min(vol_val, 0.8))
     score = w_z * z_norm + w_mdd * mdd_norm + w_vol * vol_norm
     return float(max(0.0, min(score, 1.0)))
 
+
 # -----------------------------
-# ---- CONTRARIAN OVERLAY -----
+# ---- CONTRARIAN OVERLAY ------
 # -----------------------------
 def contrarian_overlay(sentiment_inputs: Dict[str, Optional[float]]) -> float:
     fg = sentiment_inputs.get("fear_greed_index")
@@ -439,6 +476,7 @@ def contrarian_overlay(sentiment_inputs: Dict[str, Optional[float]]) -> float:
     if ns is not None and ns <= -0.3: boost += 0.03
     if pcr is not None and pcr > 1.0: boost += 0.03
     return float(np.clip(boost, 0.90, 1.15))
+
 
 # -----------------------------
 # ---- CIRCLE OF COMPETENCE ----
@@ -459,6 +497,7 @@ def circle_of_competence_pass(
     if wl and (s not in wl and i not in wl): return False
     if any(flag in flags for flag in ["pre-revenue", "binary-fda", "exploration-only", "crypto-miner"]): return False
     return True
+
 
 # -----------------------------
 # ---- STATE & CALLBACKS -------
@@ -534,26 +573,23 @@ def fetch_and_fill_from_yahoo():
 
     st.session_state["__fetched_ok"] = True  # show toast once
 
+
 # -----------------------------
-# -------- STREAMLIT UI -------
+# -------- STREAMLIT UI --------
 # -----------------------------
 def main():
     st.set_page_config(page_title="Buffett Analyzer — Extended", layout="wide")
     init_defaults()  # MUST run before any widgets are created
 
-    # Initialize ChatGPT integration
+    # Initialize ChatGPT integration - MOVED INSIDE main()
     if "chatgpt_integration" not in st.session_state:
         st.session_state["chatgpt_integration"] = ChatGPTIntegration()
+    
     chat_integration = st.session_state["chatgpt_integration"]
 
-    # Make debug flag available to the modal (modal will ignore unless implemented there)
-    st.session_state.setdefault("__chatgpt_debug", SHOW_CHATGPT_DEBUG)
-
-    # Ensure ChatGPT shows automatically on first load
-    if "show_chatgpt_modal" not in st.session_state:
-        st.session_state["show_chatgpt_modal"] = True
-
     st.title("Buffett Analyzer")
+    # Add ChatGPT trigger button
+    add_chatgpt_trigger_button()
 
     # Show success toast once after a fetch
     if st.session_state.pop("__fetched_ok", False):
@@ -592,6 +628,7 @@ def main():
         st.caption("Weights auto-normalize in the scoring function.")
 
         st.header("Contrarian Overlay (optional)", help=H("contrarian"))
+        # IMPORTANT: no 'value=' on keyed widgets to avoid Streamlit warning
         st.number_input("Fear & Greed Index (0..100)", min_value=0, max_value=100, key="inp_fg", help=H("fear_greed"))
         st.number_input("Short interest (% of float, e.g., 0.08 = 8%)", min_value=0.0, max_value=1.0, step=0.01, format="%.2f", key="inp_si", help=H("short_interest"))
         st.slider("News sentiment (−1..+1)", -1.0, 1.0, step=0.05, key="inp_ns", help=H("news_sentiment"))
@@ -607,10 +644,13 @@ def main():
     with colL:
         st.subheader("Inputs")
 
+        # Fetch button BEFORE widgets; on_click updates session_state for next render
         st.button("Fetch fundamentals from Yahoo", on_click=fetch_and_fill_from_yahoo)
 
+        # 🔎 Show quality flags (based on whatever is in session_state now)
         render_data_quality_flags()
 
+        # IMPORTANT: no 'value=' on keyed widgets to let session_state drive values
         ticker = st.text_input("Ticker", key="inp_ticker", help=H("ticker"))
         sector = st.text_input("Sector (manual or from your DB)", key="inp_sector", help=H("sector"))
         industry = st.text_input("Industry (manual or from your DB)", key="inp_industry", help=H("industry"))
@@ -640,7 +680,7 @@ def main():
     # ---------- Right column ----------
     with colR:
         st.subheader("Process")
-
+        # Circle of Competence PASS/FAIL with color
         inside_coc = circle_of_competence_pass(
             sector, industry,
             whitelist=user_whitelist,
@@ -651,6 +691,7 @@ def main():
         coc_label = f"<span style='color:{coc_color};font-weight:bold'>{'PASS' if inside_coc else 'FAIL'}</span>"
         st.markdown(f"Circle of Competence: {coc_label}", unsafe_allow_html=True)
 
+        # Intraday price (if available)
         intraday = fetch_intraday_1m(ticker)
         if not intraday.empty:
             try:
@@ -659,15 +700,18 @@ def main():
             except Exception:
                 pass
 
+        # Maintenance CapEx
         if maint_method.startswith("≈ Dep"):
             maint_capex = maintenance_capex_simple(da)
             maint_help = H("maint_dep_simple")
         else:
+            # Real 5y history via Yahoo
             gh = st.session_state.get("__greenwald_hist") or fetch_greenwald_history(ticker)
             maint_g = maintenance_capex_greenwald_from_hist(
                 gh.get("sales") or [], gh.get("ppe_net") or [], gh.get("capex") or []
             )
             if maint_g is None:
+                # Fallback to simple if insufficient data
                 maint_capex = maintenance_capex_simple(da)
                 maint_help = H("maint_greenwald") + "  \n*Insufficient history; fell back to ≈ D&A.*"
             else:
@@ -675,6 +719,7 @@ def main():
                 maint_help = H("maint_greenwald")
         st.metric("Maintenance CapEx (est.)", fmt_money_short(maint_capex), help=maint_help)
 
+        # Base Owner Earnings
         row_now = FinancialRow(
             net_income=float(net_income),
             depreciation_amortization=float(da),
@@ -684,6 +729,7 @@ def main():
         )
         oe_base = owner_earnings(row_now, maint_capex)
 
+        # Δ Working Capital (from Yahoo quarterly; shown & optionally applied)
         delta_wc = float(st.session_state.get("inp_delta_wc", 0.0))
         st.metric("Δ Working Capital (latest qtr)", fmt_money_short(delta_wc), help=H("delta_wc"))
 
@@ -695,6 +741,7 @@ def main():
         )
         st.metric("Owner Earnings (Buffett 1986)", fmt_money_short(oe_final), help=H("owner_earnings"))
 
+        # Look-through earnings
         try:
             investees = [InvesteesEarnings(**d) for d in json.loads(investee_json)]
         except Exception:
@@ -742,30 +789,37 @@ def main():
         )
         buffett_score = float(np.clip(base * 100.0 * mult, 0.0, 100.0))
 
+        # Buffett Score progress bar
         st.markdown("**Buffett Score**")
         st.progress(buffett_score / 100.0)
         st.success(f"Buffett Score (illustrative): **{buffett_score:.1f}/100**", icon="✅")
 
+        # ---- Buffett Score Breakdown expander ----
         with st.expander("📊 Buffett Score Breakdown"):
+            # Fixed top-level blend weights
             w_coc = 0.35
             w_oe  = 0.25
             w_cpr = 0.30
             w_lt  = 0.10
 
+            # Raw 0..1 component scores
             coc_raw = 1.0 if inside_coc else 0.0
             oe_raw  = (oe_ratio + 1) / 2
             cpr_raw = float(score_cprs)
             lt_raw  = (lt_ratio + 1) / 2
 
+            # Weighted components (0..1)
             coc_w = w_coc * coc_raw
             oe_w  = w_oe  * oe_raw
             cpr_w = w_cpr * cpr_raw
             lt_w  = w_lt  * lt_raw
 
+            # Base points and final with multiplier
             base_points = (coc_w + oe_w + cpr_w + lt_w) * 100.0
             final_points = float(np.clip(base_points * mult, 0.0, 100.0))
             contrarian_lift_total = final_points - min(100.0, base_points)
 
+            # Per-component contributions & lifts (in percentage points)
             rows = []
             for name, w, raw, w_contrib in [
                 ("Circle of Competence", w_coc, coc_raw, coc_w),
@@ -774,7 +828,7 @@ def main():
                 ("Look-Through Ratio",   w_lt,  lt_raw,  lt_w),
             ]:
                 contrib_pts = w_contrib * 100.0
-                lift_pts = (mult - 1.0) * contrib_pts
+                lift_pts = (mult - 1.0) * contrib_pts  # signed pp added by contrarian
                 rows.append({
                     "Component": name,
                     "Raw Weight": f"{w:.2f}",
@@ -791,6 +845,7 @@ def main():
             st.write(f"**Contrarian multiplier:** `x{mult:.3f}` → **total lift:** `{contrarian_lift_total:+.2f} pts`")
             st.write(f"**Final Buffett Score:** `{final_points:.2f} / 100`")
 
+            # Optional: Capital Preservation internals
             with st.expander("🔎 Capital Preservation internals (informational)") as _:
                 base_zone = {"Distress": 0.2, "Gray": 0.6, "Safe": 0.9}.get(zone, 0.5)
                 z_norm_disp = min(1.0, base_zone * (1.0 + 0.05 * max(z, 0.0)))
@@ -803,10 +858,12 @@ def main():
                 st.write(f"- **(1 − Volatility):** `{vol_norm_disp:.3f}` — weight in CPRS: `{w_vol:.2f}`")
                 st.write(f"- **Capital Preservation (0–1):** `{score_cprs:.3f}`")
 
+        # Owner Earnings Ratio progress bar
         st.markdown("**Owner Earnings Ratio (Owner Earnings / Sales)**")
         st.progress((oe_ratio + 1) / 2)
         st.metric("Owner Earnings Ratio", fmt_pct(oe_ratio), help="Owner Earnings as % of Sales")
 
+        # Simple guardrail banner for extreme risk
         if (not math.isnan(mdd) and mdd > 0.7) or (z < 1.1):
             st.warning("Caution: very high drawdown history and/or low Altman Z detected. Investigate solvency/liquidity risk.")
 
@@ -824,7 +881,7 @@ def main():
             with open(pdf_file, "rb") as f:
                 st.download_button("Download PDF", f, file_name=f"{ticker}_report.pdf", mime="application/pdf")
 
-    # ---- Compile company data for ChatGPT context ----
+    # MOVED INSIDE main() - Compile company data for ChatGPT context
     company_data = get_current_company_data(
         ticker=ticker,
         oe_final=oe_final,
@@ -837,10 +894,10 @@ def main():
         sales=sales
     )
 
-    # ---- Auto-render ChatGPT modal at the bottom ----
+    # MOVED INSIDE main() - Render ChatGPT modal if active
     render_chatgpt_modal(chat_integration, ticker, company_data)
 
-    # ---- Notes ----
+    # MOVED INSIDE main() - Notes caption
     st.caption("""
     **Notes**  
     • Owner Earnings per Buffett (1986): NI + D&A (+non-cash) − Maintenance CapEx (optionally adjust for ΔWC).  
