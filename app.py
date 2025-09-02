@@ -30,7 +30,7 @@ from chatgpt_integration import ChatGPTIntegration, render_chatgpt_modal
 # NEW: Paywall system imports
 try:
     from auth_manager import AuthManager
-    from quota_manager import QuotaManager  
+    from quota_manager import QuotaManager
     from subscription_manager import SubscriptionManager
     from feature_gates import FeatureGates
     PAYWALL_AVAILABLE = True
@@ -40,6 +40,26 @@ except ImportError as e:
 
 # Utility values and functions
 SHOW_CHATGPT_DEBUG = False
+
+# --- helpers for robust query param handling across Streamlit versions ---
+def _get_query_params() -> Dict[str, str]:
+    try:
+        return dict(st.query_params)  # Streamlit >= 1.30
+    except Exception:
+        try:
+            return {k: v[0] if isinstance(v, list) and len(v) == 1 else v
+                    for k, v in st.experimental_get_query_params().items()}
+        except Exception:
+            return {}
+
+def _clear_query_params() -> None:
+    try:
+        st.query_params.clear()  # Streamlit >= 1.30
+    except Exception:
+        try:
+            st.experimental_set_query_params()
+        except Exception:
+            pass
 
 # -----------------------------
 # ---------- GLOSSARY ----------
@@ -89,8 +109,8 @@ def H(key: str) -> str:
     return GLOSSARY.get(key, "")
 
 # ------- GPT INTEGRATION -------
-def get_current_company_data(ticker: str, oe_final: float, lt: float, z: float, zone: str, 
-                           score_cprs: float, buffett_score: float, net_income: float, 
+def get_current_company_data(ticker: str, oe_final: float, lt: float, z: float, zone: str,
+                           score_cprs: float, buffett_score: float, net_income: float,
                            sales: float) -> Dict:
     """Compile current company data for ChatGPT context."""
     return {
@@ -548,27 +568,59 @@ def fetch_and_fill_from_yahoo():
 # -----------------------------
 def main():
     st.set_page_config(page_title="Buffett Analyzer — Extended", layout="wide")
-    
+
     # NEW: Initialize paywall system (graceful fallback if not available)
     if PAYWALL_AVAILABLE:
         auth_manager = AuthManager()
         quota_manager = QuotaManager()
         subscription_manager = SubscriptionManager()
         feature_gates = FeatureGates(quota_manager, auth_manager)
-        
+
         # Handle authentication
         if not auth_manager.handle_login():
             st.stop()
-        
-        # Get user information
-        user_info = auth_manager.get_user_info(st.user.email)
-        is_premium = auth_manager.is_premium_user(st.user.email)
-        is_professional = auth_manager.is_professional_user(st.user.email)
+
+        # Robustly obtain user_info and user_email (no st.user.* calls)
+        user_info = None
+        user_email = None
+        current_tier = "free"
+
+        try:
+            # Prefer a no-arg accessor if provided
+            user_info = auth_manager.get_user_info()
+        except TypeError:
+            # Fallbacks if API expects/derives email internally
+            if hasattr(auth_manager, "get_current_user_email"):
+                user_email = auth_manager.get_current_user_email()
+            elif hasattr(auth_manager, "current_user_email"):
+                user_email = auth_manager.current_user_email()
+            try:
+                user_info = auth_manager.get_user_info(user_email)
+            except Exception:
+                user_info = None
+
+        if isinstance(user_info, dict):
+            user_email = user_info.get("email", user_email)
+            current_tier = user_info.get("subscription_tier", current_tier)
+
+        # Tier flags (prefer info, fallback to methods if available)
+        is_premium = current_tier in ("premium", "professional")
+        is_professional = current_tier == "professional"
+        try:
+            is_premium = is_premium or bool(auth_manager.is_premium_user(user_email))
+        except Exception:
+            pass
+        try:
+            is_professional = is_professional or bool(auth_manager.is_professional_user(user_email))
+        except Exception:
+            pass
     else:
         # Fallback: app works without paywall
         st.info("Running in open mode - paywall modules not available")
         user_info = None
-        is_premium = True  # Grant all features when paywall unavailable
+        user_email = None
+        current_tier = "professional"
+        is_premium = True
         is_professional = True
         auth_manager = None
         quota_manager = None
@@ -597,20 +649,25 @@ def main():
         with col2:
             tier_display = {
                 'free': '🆓 Free',
-                'premium': '⭐ Premium', 
+                'premium': '⭐ Premium',
                 'professional': '🏆 Professional'
             }
-            current_tier = user_info['subscription_tier']
-            st.write(f"Welcome, {user_info['name']}!")
+            st.write(f"Welcome, {user_info.get('name', 'Investor')}!")
             st.success(f"{tier_display.get(current_tier, '🆓 Free')}")
-            
             account_col1, account_col2 = st.columns(2)
             with account_col1:
                 if st.button("⚙️ Account", key="account_settings"):
                     st.session_state["show_account_modal"] = True
             with account_col2:
                 if st.button("🚪 Logout", key="logout_btn"):
-                    st.logout()
+                    # No st.logout(); use your auth layer and clear params
+                    if hasattr(auth_manager, "logout"):
+                        try:
+                            auth_manager.logout()
+                        except Exception:
+                            pass
+                    st.session_state.clear()
+                    _clear_query_params()
                     st.rerun()
     else:
         st.title("Buffett Analyzer")
@@ -619,30 +676,36 @@ def main():
     if st.session_state.pop("__fetched_ok", False):
         st.success("Auto-filled latest available fundamentals from Yahoo.")
 
-    # NEW: Handle payment success and modals
+    # NEW: Handle payment success and modals (loop-safe)
     if PAYWALL_AVAILABLE:
-        if st.query_params.get('payment') == 'success':
-            session_id = st.query_params.get('session_id')
-            if session_id:
-                subscription_manager.handle_successful_payment(session_id)
+        qp = _get_query_params()
+        if qp.get('payment') == 'success':
+            session_id = qp.get('session_id')
+            if session_id and not st.session_state.get('__payment_handled'):
+                try:
+                    subscription_manager.handle_successful_payment(session_id)
+                except Exception as e:
+                    st.error(f"Payment processing error: {e}")
+                st.session_state['__payment_handled'] = True
+                _clear_query_params()
                 st.rerun()
-        
+
         if st.session_state.get("show_upgrade_modal", False):
-            subscription_manager.show_upgrade_modal(st.user.email, current_tier)
+            subscription_manager.show_upgrade_modal(user_email, current_tier)
             if st.button("✕ Close", key="close_upgrade_modal"):
                 st.session_state["show_upgrade_modal"] = False
                 st.rerun()
-        
+
         if st.session_state.get("show_account_modal", False):
-            subscription_manager.show_account_settings(st.user.email)
+            subscription_manager.show_account_settings(user_email)
             if st.button("✕ Close", key="close_account_modal"):
                 st.session_state["show_account_modal"] = False
                 st.rerun()
-        
+
         # Gate analysis permission
-        if not feature_gates.check_analysis_permission(st.user.email, is_premium or is_professional):
+        if not feature_gates.check_analysis_permission(user_email, is_premium or is_professional):
             st.stop()
-        
+
         # Show upgrade prompt for free users
         if not is_premium:
             with st.expander("🚀 Unlock Full Investment Analysis Power", expanded=False):
@@ -654,18 +717,18 @@ def main():
     with st.sidebar:
         # NEW: Show usage stats for free users
         if PAYWALL_AVAILABLE and not is_premium:
-            feature_gates.show_usage_dashboard(st.user.email)
+            feature_gates.show_usage_dashboard(user_email)
             st.markdown("---")
 
         st.header("Circle of Competence", help=H("circle_of_competence"))
-        
+
         # NEW: Limit selections for free users
         max_selections = None
         help_text = H("whitelist")
         if PAYWALL_AVAILABLE and not is_premium:
             max_selections = 3
             help_text += " (Free: max 3 selections)"
-        
+
         user_whitelist = st.multiselect(
             "Whitelisted sectors/industries",
             ["Consumer Staples","Consumer Discretionary","Financials","Healthcare","Industrials","Energy","Utilities","Tech/Platforms","REITs","Materials","Telecom"],
@@ -681,7 +744,7 @@ def main():
         )
 
         st.header("Owner Earnings Settings", help=H("owner_earnings"))
-        
+
         # NEW: Gate Greenwald method for Professional only
         if PAYWALL_AVAILABLE and not is_professional:
             st.radio(
@@ -697,7 +760,7 @@ def main():
                 ["≈ Depreciation (simple)", "Greenwald PPE/Sales (5y)"],
                 help=H("maint_capex_method"),
             )
-        
+
         # ΔWC controls
         st.checkbox("Include Δ Working Capital in OE (only increases)", key="inp_include_wc", help=H("delta_wc"))
         st.toggle("ΔWC: penalize only increases (on)", key="inp_wc_only_inc")
@@ -736,12 +799,12 @@ def main():
         render_data_quality_flags()
 
         ticker = st.text_input("Ticker", key="inp_ticker", help=H("ticker"))
-        
+
         # NEW: Gate ticker access
         if PAYWALL_AVAILABLE and ticker:
             if not feature_gates.check_ticker_access(ticker, is_premium or is_professional):
                 st.stop()
-        
+
         sector = st.text_input("Sector (manual or from your DB)", key="inp_sector", help=H("sector"))
         industry = st.text_input("Industry (manual or from your DB)", key="inp_industry", help=H("industry"))
 
@@ -761,7 +824,7 @@ def main():
         tl     = money_number_input("Total Liabilities", key="inp_tl", step=500.0, help=H("total_liabilities"))
 
         st.markdown("**Investee (Look-Through) — optional**")
-        
+
         # NEW: Gate Look-Through Earnings
         look_through_available = not PAYWALL_AVAILABLE or is_premium or is_professional
         if look_through_available:
@@ -976,11 +1039,12 @@ def main():
             pdf_allowed = not PAYWALL_AVAILABLE or is_premium or is_professional
             if pdf_allowed:
                 # Record usage
-                if PAYWALL_AVAILABLE and not (is_premium or is_professional):
-                    quota_manager.increment_analysis_usage(st.user.email, ticker, buffett_score, oe_final)
-                elif PAYWALL_AVAILABLE:
-                    quota_manager.increment_analysis_usage(st.user.email, ticker, buffett_score, oe_final)
-                
+                if PAYWALL_AVAILABLE:
+                    try:
+                        quota_manager.increment_analysis_usage(user_email, ticker, buffett_score, oe_final)
+                    except Exception:
+                        pass
+
                 # Generate PDF
                 metrics = {
                     "Owner Earnings": fmt_money_short(oe_final),
@@ -1028,19 +1092,22 @@ def main():
     else:
         # Track ChatGPT usage
         if PAYWALL_AVAILABLE and st.session_state.get("chatgpt_used_this_session"):
-            quota_manager.increment_chatgpt_usage(st.user.email)
+            try:
+                quota_manager.increment_chatgpt_usage(user_email)
+            except Exception:
+                pass
             st.session_state["chatgpt_used_this_session"] = False
-        
+
         # Render ChatGPT modal
         render_chatgpt_modal(chat_integration, ticker, company_data)
 
     # ---- Notes ----
     st.caption("""
-    **Notes**  
-    • Owner Earnings per Buffett (1986): NI + D&A (+non-cash) − Maintenance CapEx (optionally adjust for ΔWC).  
-    • Look-Through Earnings per Buffett (1991): add retained earnings of investees pro-rata (after tax).  
-    • Capital Preservation blends Altman Z (or Z'), Max Drawdown, and volatility.  
-    • Contrarian overlay is optional and user-weighted.  
+    **Notes**
+    • Owner Earnings per Buffett (1986): NI + D&A (+non-cash) − Maintenance CapEx (optionally adjust for ΔWC).
+    • Look-Through Earnings per Buffett (1991): add retained earnings of investees pro-rata (after tax).
+    • Capital Preservation blends Altman Z (or Z'), Max Drawdown, and volatility.
+    • Contrarian overlay is optional and user-weighted.
     • Yahoo fundamentals are best-effort; validate before making decisions.
     """)
 
