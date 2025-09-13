@@ -1,242 +1,299 @@
-# auth_manager.py  (v2)
-# Minimal Streamlit-based auth with a tiny JSON "DB" for stats
+# UPDATED 2025-09-13 19:32:48Z — Fixes: unique Streamlit keys, OAuth client_secret, st.query_params, clear URL params, remove duplicate Sign out
+# auth_manager.py
+# Google OAuth for Streamlit with robust state handling (HMAC-signed, time-bound) and PKCE support.
+# Fixes common "OAuth state mismatch" by avoiding reliance on ephemeral Streamlit session state.
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Dict
-from pathlib import Path
-from datetime import datetime, timezone
+import base64
+import hashlib
+import hmac
 import json
-import re
 import os
-import streamlit as st
+import secrets
+import time
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
-_VALID_TIERS = ("free", "premium", "professional")
-_STORE_ENV = "AUTH_STORE_PATH"
-_STORE_DEFAULT = ".data/paywall_store.json"
+import requests
+import streamlit as st
+from dotenv import load_dotenv, find_dotenv
+from urllib.parse import urlencode, urlparse, urlunparse
+
+# -----------------------------------------------------------------------------
+# Load env
+# -----------------------------------------------------------------------------
+_ENV_PATH = find_dotenv(usecwd=True)
+load_dotenv(_ENV_PATH, override=False)
+
+GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_USERINFO_ENDPOINT = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+DEFAULT_SCOPES = ["openid", "email", "profile"]
+STATE_TTL_SECONDS = 10 * 60  # 10 minutes default
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.getenv(name)
+    if v:
+        return v.strip()
+    try:
+        sv = st.secrets.get(name)  # type: ignore[attr-defined]
+        if sv:
+            return str(sv).strip()
+    except Exception:
+        pass
+    return default
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(s: str) -> bytes:
+    pad = "=" * (-len(s) % 4)
+    return base64.urlsafe_b64decode(s + pad)
+
+
+def _sign_state(payload: Dict[str, str], secret: str) -> str:
+    """
+    Create a compact, signed state token: base64url(header).base64url(payload).base64url(sig)
+    header={"alg":"HS256","typ":"STATE"}
+    """
+    header = {"alg": "HS256", "typ": "STATE"}
+    j_header = json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    j_payload = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    to_sign = b".".join([_b64url(j_header).encode(), _b64url(j_payload).encode()])
+    sig = hmac.new(secret.encode("utf-8"), to_sign, hashlib.sha256).digest()
+    return ".".join([_b64url(j_header), _b64url(j_payload), _b64url(sig)])
+
+
+def _verify_state(state_token: str, secret: str, ttl_seconds: int = STATE_TTL_SECONDS) -> Tuple[bool, Optional[Dict]]:
+    try:
+        parts = state_token.split(".")
+        if len(parts) != 3:
+            return False, None
+        header_b64, payload_b64, sig_b64 = parts
+        to_sign = (header_b64 + "." + payload_b64).encode("utf-8")
+        expected_sig = hmac.new(secret.encode("utf-8"), to_sign, hashlib.sha256).digest()
+        if not hmac.compare_digest(expected_sig, _b64url_decode(sig_b64)):
+            return False, None
+        payload = json.loads(_b64url_decode(payload_b64))
+        ts = int(payload.get("ts", 0))
+        if int(time.time()) - ts > ttl_seconds:
+            return False, None
+        return True, payload
+    except Exception:
+        return False, None
+
+
+def _build_redirect_uri() -> str:
+    """
+    Decide redirect URI:
+    - Require GOOGLE_REDIRECT_URI (exact URL registered in Google Console).
+    We do NOT guess here; incorrect guessing is a major source of OAuth failures.
+    """
+    redir = _get_env("GOOGLE_REDIRECT_URI")
+    if not redir:
+        raise RuntimeError(
+            "GOOGLE_REDIRECT_URI is not set. Please set it to the exact redirect URL "
+            "you registered in Google Cloud Console (including scheme and path)."
+        )
+    parsed = urlparse(redir)
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def _pkce_pair() -> Tuple[str, str]:
+    """
+    Generate (code_verifier, code_challenge) pair for PKCE S256.
+    """
+    verifier = _b64url(secrets.token_bytes(32))
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = _b64url(digest)
+    return verifier, challenge
 
 
 @dataclass
-class UserInfo:
-    email: str
-    name: str
-    subscription_tier: str = "free"
-    is_authenticated: bool = False
+class GoogleTokens:
+    access_token: str
+    refresh_token: Optional[str]
+    id_token: Optional[str]
+    expires_in: int
+    token_type: str
 
-    def to_dict(self) -> Dict[str, str]:
-        return {
-            "email": self.email,
-            "name": self.name,
-            "subscription_tier": self.subscription_tier,
-            "is_authenticated": self.is_authenticated,
-        }
-
-
-def _valid_email(addr: str) -> bool:
-    return bool(addr and isinstance(addr, str) and re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", addr))
+# -----------------------------------------------------------------------------
+# Public API
+# -----------------------------------------------------------------------------
+def is_authenticated() -> bool:
+    return bool(st.session_state.get("google_user"))
 
 
-def _get_query_params() -> Dict[str, str]:
+def current_user() -> Optional[Dict]:
+    return st.session_state.get("google_user")
+
+
+def _clear_oauth_params():
+    # Clean query params so refresh doesn't re-trigger auth
     try:
-        return dict(st.query_params)  # streamlit >= 1.30
+        for k in ("code", "state", "scope", "authuser", "prompt"):
+            if k in st.query_params:
+                del st.query_params[k]
     except Exception:
-        try:
-            qp = st.experimental_get_query_params()
-            return {k: (v[0] if isinstance(v, list) and len(v) == 1 else v) for k, v in qp.items()}
-        except Exception:
-            return {}
+        pass
 
 
-class AuthManager:
-    STATE_KEY = "auth.user"
+def logout():
+    st.session_state.pop("google_tokens", None)
+    st.session_state.pop("google_user", None)
+    _clear_oauth_params()
+    st.success("You have been signed out.")
 
-    def __init__(self, allowed_domains: Optional[list[str]] = None):
-        self.allowed_domains = set([d.lower() for d in allowed_domains]) if allowed_domains else None
-        self._ensure_state()
-        self._ensure_store()
 
-    # ----------------- Public API -----------------
+def _exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: Optional[str]) -> GoogleTokens:
+    cid = _get_env("GOOGLE_CLIENT_ID", "")
+    csec = _get_env("GOOGLE_CLIENT_SECRET", "")
+    data = {
+        "code": code,
+        "client_id": cid,
+        "redirect_uri": redirect_uri,
+        "grant_type": "authorization_code",
+    }
+    # Use PKCE if available AND authenticate as a confidential client
+    if code_verifier:
+        data["code_verifier"] = code_verifier
+    if csec:
+        data["client_secret"] = csec
 
-    def handle_login(self) -> bool:
-        # Dev/bootstrap via query params
-        qp = _get_query_params()
-        if not self._state["is_authenticated"]:
-            qp_email = qp.get("login_as")
-            qp_tier = qp.get("tier")
-            if qp_email and _valid_email(qp_email) and self._email_allowed(qp_email):
-                tier = (qp_tier or "free").lower()
-                if tier not in _VALID_TIERS:
-                    tier = "free"
-                self._state.update({
-                    "email": qp_email.strip(),
-                    "name": qp_email.split("@")[0].replace(".", " ").title(),
-                    "subscription_tier": tier,
-                    "is_authenticated": True,
-                })
-                st.session_state[self.STATE_KEY] = self._state
-                self._record_login(qp_email, tier, self._state["name"])
-                return True
+    resp = requests.post(GOOGLE_TOKEN_ENDPOINT, data=data, timeout=10)
+    resp.raise_for_status()
+    js = resp.json()
+    return GoogleTokens(
+        access_token=js.get("access_token", ""),
+        refresh_token=js.get("refresh_token"),
+        id_token=js.get("id_token"),
+        expires_in=int(js.get("expires_in", 0)),
+        token_type=js.get("token_type", "Bearer"),
+    )
 
-        if self._state["is_authenticated"]:
-            return True
 
-        # Render simple login UI (no rerun loop)
-        st.markdown("### Sign in")
-        with st.form("login_form", clear_on_submit=False):
-            email = st.text_input("Email", key="auth_email_input", placeholder="you@company.com")
-            name = st.text_input("Display name (optional)", key="auth_name_input", placeholder="Your name")
-            submitted = st.form_submit_button("Sign in")
+def _fetch_userinfo(access_token: str) -> Dict:
+    r = requests.get(
+        GOOGLE_USERINFO_ENDPOINT,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=10,
+    )
+    r.raise_for_status()
+    return r.json()
 
-        if submitted:
-            if not _valid_email(email):
-                st.error("Please enter a valid email address.")
-                return False
-            if not self._email_allowed(email):
-                st.error("This email domain is not allowed.")
-                return False
 
-            display = (name or email.split("@")[0]).strip().replace(".", " ").title()
-            tier = self._coerce_tier(self._state.get("subscription_tier"))
-            self._state.update({
-                "email": email.strip(),
-                "name": display,
-                "subscription_tier": tier,
-                "is_authenticated": True,
-            })
-            st.session_state[self.STATE_KEY] = self._state
-            self._record_login(email, tier, display)
-            st.success("Signed in.")
-            return True
+def render_auth_ui(button_label: str = "Sign in with Google"):
+    """
+    Renders a small auth box that either:
+      - shows a "Sign in with Google" button (and constructs the auth URL), or
+      - handles the OAuth callback (code/state) and shows the signed-in user's email + Sign out button.
+    """
+    cid = _get_env("GOOGLE_CLIENT_ID")
+    csec = _get_env("GOOGLE_CLIENT_SECRET")
+    if not cid:
+        st.error("GOOGLE_CLIENT_ID is not set.")
+        return
+    if not csec:
+        st.info("Tip: set GOOGLE_CLIENT_SECRET for stronger state signing (still recommended with PKCE).")
 
-        st.info("Sign in to continue.")
-        return False
+    # Always require a proper redirect URI to avoid guesswork
+    try:
+        redirect_uri = _build_redirect_uri()
+    except RuntimeError as e:
+        st.error(str(e))
+        return
 
-    def get_user_info(self, email: Optional[str] = None) -> Optional[Dict[str, str]]:
-        self._ensure_state()
-        if not self._state["is_authenticated"]:
-            return None
-        if email and email != self._state["email"]:
-            return None
-        return UserInfo(
-            email=self._state["email"],
-            name=self._state.get("name") or self._state["email"].split("@")[0],
-            subscription_tier=self._coerce_tier(self._state.get("subscription_tier")),
-            is_authenticated=True,
-        ).to_dict()
+    # 1) Handle callback (if present)
+    try:
+        qp = dict(st.query_params)  # {"code": "...", "state": "...", ...}
+    except Exception:
+        qp = {}
 
-    def get_current_user_email(self) -> Optional[str]:
-        self._ensure_state()
-        return self._state["email"] if self._state["is_authenticated"] else None
+    code = qp.get("code")
+    state = qp.get("state")
 
-    def is_premium_user(self, email: Optional[str]) -> bool:
-        info = self.get_user_info(email)
-        return bool(info and info.get("subscription_tier") in ("premium", "professional"))
+    if code and state:
+        valid, payload = _verify_state(state, csec or cid)
+        if not valid:
+            st.error("OAuth state mismatch. Please try again. (state failed verification)")
+        else:
+            # Extract PKCE verifier from signed state payload (no session dependence)
+            code_verifier = payload.get("pkce")
+            try:
+                tokens = _exchange_code_for_tokens(code, redirect_uri, code_verifier)
+                st.session_state["google_tokens"] = tokens.__dict__
+                userinfo = _fetch_userinfo(tokens.access_token)
+                st.session_state["google_user"] = {
+                    "email": userinfo.get("email"),
+                    "name": userinfo.get("name"),
+                    "picture": userinfo.get("picture"),
+                    "sub": userinfo.get("sub"),
+                }
+                _clear_oauth_params()
+                st.success(f"Signed in as {userinfo.get('email')}")
+            except requests.HTTPError as e:
+                st.error(f"Token exchange failed: {e.response.text if e.response is not None else e}")
+            except Exception as e:
+                st.error(f"Unexpected error during auth: {e}")
 
-    def is_professional_user(self, email: Optional[str]) -> bool:
-        info = self.get_user_info(email)
-        return bool(info and info.get("subscription_tier") == "professional")
+    # 2) If authenticated, show user + logout
+    if is_authenticated():
+        u = current_user() or {}
+        cols = st.columns([1, 3, 2])
+        with cols[0]:
+            if u.get("picture"):
+                st.image(u["picture"], width=40)
+        with cols[1]:
+            st.write(f"**{u.get('name') or u.get('email')}**")
+            st.caption(u.get("email", ""))
+        with cols[2]:
+            if st.button("Sign out", key="btn_signout_auth"):
+                logout()
+        return
 
-    def set_subscription_tier(self, tier: str) -> None:
-        self._ensure_state()
-        if not self._state["is_authenticated"]:
-            return
-        t = self._coerce_tier(tier)
-        self._state["subscription_tier"] = t
-        st.session_state[self.STATE_KEY] = self._state
-        # persist in store
-        email = self._state["email"]
-        store = self._load_store()
-        u = store.setdefault("users", {}).setdefault(email, {})
-        u["tier"] = t
-        u.setdefault("name", self._state.get("name") or email)
-        self._save_store(store)
+    # 3) Not authenticated: render "Sign in" button that kicks off OAuth with signed state + PKCE
+    # Build our signed state (no st.session_state dependency)
+    verifier, challenge = _pkce_pair()
+    payload = {
+        "ts": int(time.time()),
+        "nonce": _b64url(secrets.token_bytes(12)),
+        "app": "buffett-analyzer",
+        # IMPORTANT: include PKCE verifier in signed state so we have it after redirect
+        "pkce": verifier,
+    }
+    signed_state = _sign_state(payload, csec or cid)
 
-    def get_user_stats(self) -> Dict[str, int | str | bool]:
-        """
-        Compatibility method for your tests.
-        Returns aggregate stats + current user context.
-        """
-        store = self._load_store()
-        users = store.get("users", {})
-        total_users = len(users)
-        premium = sum(1 for u in users.values() if u.get("tier") == "premium")
-        professional = sum(1 for u in users.values() if u.get("tier") == "professional")
-        logins_total = sum(int(u.get("logins", 0)) for u in users.values())
-        last_login_global = max((u.get("last_login_at", "") for u in users.values()), default="")
-        return {
-            "total_users": total_users,
-            "premium_users": premium,
-            "professional_users": professional,
-            "logins_total": logins_total,
-            "last_login_global": last_login_global,
-            "current_user_email": self._state.get("email"),
-            "is_authenticated": bool(self._state.get("is_authenticated")),
-        }
+    auth_params = {
+        "response_type": "code",
+        "client_id": cid,
+        "redirect_uri": redirect_uri,
+        "scope": " ".join(DEFAULT_SCOPES),
+        "state": signed_state,
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        # PKCE
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    auth_url = f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(auth_params)}"
 
-    def logout(self) -> None:
-        self._ensure_state()
-        self._state.update({
-            "email": None,
-            "name": None,
-            "subscription_tier": "free",
-            "is_authenticated": False,
-        })
-        st.session_state[self.STATE_KEY] = self._state
+    if st.button(button_label, type="primary", use_container_width=True, key="btn_google_signin"):
+        st.markdown(f'[Continue to Google →]({auth_url})')
+    else:
+        st.markdown(f"[{button_label}]({auth_url})")
 
-    # ----------------- Internals -----------------
 
-    def _ensure_state(self) -> None:
-        if self.STATE_KEY not in st.session_state:
-            st.session_state[self.STATE_KEY] = {
-                "email": None,
-                "name": None,
-                "subscription_tier": "free",
-                "is_authenticated": False,
-            }
-        self._state = st.session_state[self.STATE_KEY]
-
-    def _email_allowed(self, email: str) -> bool:
-        if not self.allowed_domains:
-            return True
-        try:
-            domain = email.split("@", 1)[1].lower()
-        except Exception:
-            return False
-        return domain in self.allowed_domains
-
-    @staticmethod
-    def _coerce_tier(tier: Optional[str]) -> str:
-        t = (tier or "free").lower()
-        return t if t in _VALID_TIERS else "free"
-
-    # ----- tiny JSON store for testable stats -----
-
-    def _store_path(self) -> Path:
-        p = Path(os.getenv(_STORE_ENV, _STORE_DEFAULT))
-        p.parent.mkdir(parents=True, exist_ok=True)
-        return p
-
-    def _ensure_store(self) -> None:
-        p = self._store_path()
-        if not p.exists():
-            p.write_text(json.dumps({"users": {}}, indent=2))
-
-    def _load_store(self) -> dict:
-        try:
-            return json.loads(self._store_path().read_text() or "{}")
-        except Exception:
-            return {"users": {}}
-
-    def _save_store(self, data: dict) -> None:
-        tmp = self._store_path().with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2))
-        tmp.replace(self._store_path())
-
-    def _record_login(self, email: str, tier: str, name: str) -> None:
-        store = self._load_store()
-        user = store.setdefault("users", {}).setdefault(email, {})
-        user["tier"] = self._coerce_tier(tier)
-        user["name"] = name or email
-        user["logins"] = int(user.get("logins", 0)) + 1
-        user["last_login_at"] = datetime.now(timezone.utc).isoformat()
-        self._save_store(store)
+# Backward-compat convenience
+def require_auth():
+    """Call this at the top of your app page to force sign-in."""
+    render_auth_ui()
+    if not is_authenticated():
+        st.stop()

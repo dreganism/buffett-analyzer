@@ -14,7 +14,7 @@ def export_pdf(filename, company_name, buffett_score, metrics: dict):
     subtitle_style = styles['Heading2']
     normal = styles['BodyText']
 
-    content.append(Paragraph("Buffett Analyzer — Company Report", title_style))
+    content.append(Paragraph("Company Report", title_style))
     content.append(Paragraph(f"Company: <b>{company_name}</b>", normal))
     content.append(Paragraph(f"Date: {datetime.today().strftime('%Y-%m-%d')}", normal))
     content.append(Spacer(1, 12))
