@@ -188,12 +188,14 @@ def _fetch_userinfo(access_token: str) -> Dict:
     r.raise_for_status()
     return r.json()
 
-
+# --- Begin render_auth_ui ---
 def render_auth_ui(button_label: str = "Sign in with Google"):
     """
-    Renders a small auth box that either:
-      - shows a "Sign in with Google" button (and constructs the auth URL), or
-      - handles the OAuth callback (code/state) and shows the signed-in user's email + Sign out button.
+    Sidebar UI:
+      - If callback params present (code/state) -> complete OAuth, store user, clear URL.
+      - If signed in -> show name/email + 'Sign out' button.
+      - Else -> show ONE 'Sign in with Google' button that is a direct link
+        (st.link_button) to the Google OAuth URL — no separate text link.
     """
     cid = _get_env("GOOGLE_CLIENT_ID")
     csec = _get_env("GOOGLE_CLIENT_SECRET")
@@ -203,16 +205,16 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
     if not csec:
         st.info("Tip: set GOOGLE_CLIENT_SECRET for stronger state signing (still recommended with PKCE).")
 
-    # Always require a proper redirect URI to avoid guesswork
+    # Require a valid redirect URI
     try:
         redirect_uri = _build_redirect_uri()
     except RuntimeError as e:
         st.error(str(e))
         return
 
-    # 1) Handle callback (if present)
+    # 1️⃣ Handle OAuth callback if Google sent us ?code=…&state=…
     try:
-        qp = dict(st.query_params)  # {"code": "...", "state": "...", ...}
+        qp = dict(st.query_params)
     except Exception:
         qp = {}
 
@@ -222,10 +224,9 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
     if code and state:
         valid, payload = _verify_state(state, csec or cid)
         if not valid:
-            st.error("OAuth state mismatch. Please try again. (state failed verification)")
+            st.error("OAuth state mismatch. Please try again.")
         else:
-            # Extract PKCE verifier from signed state payload (no session dependence)
-            code_verifier = payload.get("pkce")
+            code_verifier = payload.get("pkce")  # PKCE verifier stored in signed state
             try:
                 tokens = _exchange_code_for_tokens(code, redirect_uri, code_verifier)
                 st.session_state["google_tokens"] = tokens.__dict__
@@ -243,7 +244,7 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
             except Exception as e:
                 st.error(f"Unexpected error during auth: {e}")
 
-    # 2) If authenticated, show user + logout
+    # 2️⃣ If already authenticated: show user + Sign out
     if is_authenticated():
         u = current_user() or {}
         cols = st.columns([1, 3, 2])
@@ -258,15 +259,13 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
                 logout()
         return
 
-    # 3) Not authenticated: render "Sign in" button that kicks off OAuth with signed state + PKCE
-    # Build our signed state (no st.session_state dependency)
+    # 3️⃣ Not authenticated: show ONE clickable button that links directly to Google OAuth
     verifier, challenge = _pkce_pair()
     payload = {
         "ts": int(time.time()),
         "nonce": _b64url(secrets.token_bytes(12)),
         "app": "buffett-analyzer",
-        # IMPORTANT: include PKCE verifier in signed state so we have it after redirect
-        "pkce": verifier,
+        "pkce": verifier,  # include verifier in signed state; we’ll read it after redirect
     }
     signed_state = _sign_state(payload, csec or cid)
 
@@ -279,17 +278,15 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
         "access_type": "offline",
         "include_granted_scopes": "true",
         "prompt": "consent",
-        # PKCE
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }
     auth_url = f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(auth_params)}"
 
-    if st.button(button_label, type="primary", use_container_width=True, key="btn_google_signin"):
-        st.markdown(f'[Continue to Google →]({auth_url})')
-    else:
-        st.markdown(f"[{button_label}]({auth_url})")
+    # 🔵 CSP-safe: Streamlit 1.32+ link_button renders a styled button that’s a direct link.
+    st.link_button(button_label, auth_url, use_container_width=True)
 
+# --- End of render_auth_ui ---
 
 # Backward-compat convenience
 def require_auth():

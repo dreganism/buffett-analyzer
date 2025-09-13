@@ -1,4 +1,3 @@
-# UPDATED 2025-09-13 19:32:48Z — Fixes: unique Streamlit keys, OAuth client_secret, st.query_params, clear URL params, remove duplicate Sign out
 # app.py
 # Buffett Analyzer — Extended (Python + Streamlit)
 # Includes: Circle of Competence, Owner Earnings (+ optional ΔWC), Altman Z/Drawdown/Vol risk,
@@ -25,6 +24,20 @@ import os
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
 import streamlit as st
+
+
+def _as_df(x):
+    import pandas as pd
+    if x is None:
+        return pd.DataFrame()
+    if isinstance(x, pd.DataFrame):
+        return x
+    if isinstance(x, pd.Series):
+        return x.to_frame()
+    try:
+        return pd.DataFrame(x)
+    except Exception:
+        return pd.DataFrame()
 
 from report import export_pdf
 
@@ -186,7 +199,7 @@ def render_data_quality_flags():
         pass
     if msgs:
         st.warning("Potential data quality issues:")
-        st.markdown("\\n".join([f"- {m}" for m in msgs]))
+        st.markdown("\n".join([f"- {m}" for m in msgs]))
 
 # -----------------------------
 # ---------- UTIL -------------
@@ -547,6 +560,37 @@ def fetch_and_fill_from_yahoo():
 # -----------------------------
 # -------- STREAMLIT UI -------
 # -----------------------------
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = df.copy()
+            df.columns = df.columns.get_level_values(-1)
+        except Exception:
+            df.columns = [str(c) for c in df.columns]
+    return df
+
+def _pick_price_series(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+    df = _flatten_columns(df.copy())
+    cols = [str(c).strip() for c in df.columns]
+    norm = {c.lower().replace(" ","").replace("_",""): c for c in cols}
+    # Prefer Close/price-like fields, exclude volume-like
+    for key in ["close","adjclose","regularmarketprice","price","last","c"]:
+        if key in norm:
+            s = pd.to_numeric(df[norm[key]], errors="coerce").dropna()
+            if not s.empty:
+                return s
+    num = df.select_dtypes(include=["number"])
+    if not num.empty:
+        vol_like = {"volume","vol","volumes","regularmarketvolume","totalvolume"}
+        keep_cols = [c for c in num.columns if str(c).strip().lower() not in vol_like]
+        if keep_cols:
+            s = pd.to_numeric(num[keep_cols].iloc[:, -1], errors="coerce").dropna()
+            if not s.empty:
+                return s
+    return None
+
 def main():
     st.set_page_config(page_title="Buffett Analyzer — Extended", layout="wide")
     init_defaults()  # MUST run before any widgets are created
@@ -555,12 +599,17 @@ def main():
     with st.sidebar:
         st.header("Account")
         if AUTH_AVAILABLE:
-            render_auth_ui()  # renders Sign in / handles callback, also provides its own Sign out
+            render_auth_ui()  # renders Sign in / handles callback
             if not is_authenticated():
                 st.info("Please sign in with Google to continue.")
                 st.stop()
             u = current_user() or {}
             st.caption(f"Signed in: {u.get('email','')}")
+            if st.button("Sign out"):
+                try:
+                    logout()
+                finally:
+                    st.rerun()
         else:
             st.warning("Auth not configured; running in open mode.")
 
@@ -617,7 +666,7 @@ def main():
         st.header("Contrarian Overlay (optional)", help=H("contrarian"))
         st.number_input("Fear & Greed Index (0..100)", min_value=0, max_value=100, key="inp_fg", help=H("fear_greed"))
         st.number_input("Short interest (% of float, e.g., 0.08 = 8%)", min_value=0.0, max_value=1.0, step=0.01, format="%.2f", key="inp_si", help=H("short_interest"))
-        st.slider("News sentiment (−1..+1)", -1.0, 1.0, step=0.05, key="inp_ns", help=H("news_sentiment"))
+        st.slider("News sentiment (−1..+1)", -1.0, 1.0, value=float(st.session_state.get("inp_ns", 0.0)), step=0.05, key="inp_ns", help=H("news_sentiment"))
         st.number_input("Put/Call Ratio", min_value=0.0, max_value=5.0, step=0.1, key="inp_pcr", help=H("put_call"))
 
         with st.expander("Glossary"):
@@ -630,7 +679,7 @@ def main():
     with colL:
         st.subheader("Inputs")
 
-        st.button("Fetch fundamentals from Yahoo", key="btn_fetch_funda", on_click=fetch_and_fill_from_yahoo)
+        st.button("Fetch fundamentals from Yahoo", on_click=fetch_and_fill_from_yahoo)
 
         render_data_quality_flags()
 
@@ -674,30 +723,42 @@ def main():
         coc_label = f"<span style='color:{coc_color};font-weight:bold'>{'PASS' if inside_coc else 'FAIL'}</span>"
         st.markdown(f"Circle of Competence: {coc_label}", unsafe_allow_html=True)
 
-        intraday = fetch_intraday_1m(ticker)
-        # Avoid DataFrame truthiness (ambiguous). Normalize to empty DataFrame when None/empty/invalid.
-        if intraday is None:
-            intraday = pd.DataFrame()
-        elif isinstance(intraday, pd.Series):
-            intraday = intraday.to_frame()
-        elif isinstance(intraday, pd.DataFrame):
-            # ensure consistent columns
-            if intraday.empty:
-                intraday = pd.DataFrame()
-        else:
-            # Try to coerce to DataFrame; if it fails, fallback to empty.
-            try:
-                intraday = pd.DataFrame(intraday)
-            except Exception:
-                intraday = pd.DataFrame()
+        intraday = _as_df(fetch_intraday_1m(ticker))
 
-        if not intraday.empty and "Close" in intraday.columns:    
+        s_close = None
+        try:
+            if isinstance(intraday, pd.DataFrame):
+                s_close = _pick_price_series(intraday)
+            elif isinstance(intraday, pd.Series):
+                s = pd.to_numeric(intraday, errors="coerce").dropna(); s_close = s if not s.empty else None
+            elif isinstance(intraday, (list, tuple, np.ndarray)):
+                s = pd.to_numeric(pd.Series(np.asarray(intraday).ravel()), errors="coerce").dropna(); s_close = s if not s.empty else None
+            elif isinstance(intraday, dict):
+                for k in ("Close","close","adj close","adj_close","adjclose","regularMarketPrice","price","last","c"):
+                    if k in intraday:
+                        s = pd.to_numeric(pd.Series(intraday[k]), errors="coerce").dropna()
+                        if not s.empty:
+                            s_close = s; break
+        except Exception as e:
+            st.info(f"Intraday parsing error: {e}")
+
+        if s_close is not None and not s_close.empty:
             try:
-                last_px = pd.to_numeric(intraday["Close"], errors="coerce").dropna().iloc[-1]
-                last_px = float(last_px)
-                st.metric("Latest Price (1m)", fmt_money_price(last_px))
+                last_px = float(s_close.iloc[-1])
+                # Relative sanity check vs last daily close
+                ok_to_show = True
+                try:
+                    recent = load_prices(ticker)
+                    if hasattr(recent, 'empty') and not recent.empty:
+                        ref = float(recent.dropna().iloc[-1])
+                        if ref > 0 and (last_px > 5*ref or last_px < 0.2*ref):
+                            ok_to_show = False
+                except Exception:
+                    pass
+                if ok_to_show:
+                    st.metric("Latest Price (1m)", fmt_money_price(last_px))
             except Exception as e:
-                st.write(f"Intraday parsing error: {e}")
+                st.info(f"Intraday parsing error: {e}")
 
         if maint_method.startswith("≈ Dep"):
             maint_capex = maintenance_capex_simple(da)
@@ -709,7 +770,7 @@ def main():
             )
             if maint_g is None:
                 maint_capex = maintenance_capex_simple(da)
-                maint_help = H("maint_greenwald") + "  \\n*Insufficient history; fell back to ≈ D&A.*"
+                maint_help = H("maint_greenwald") + "  \n*Insufficient history; fell back to ≈ D&A.*"
             else:
                 maint_capex = maint_g
                 maint_help = H("maint_greenwald")
@@ -736,10 +797,24 @@ def main():
         st.metric("Owner Earnings (Buffett 1986)", fmt_money_short(oe_final), help=H("owner_earnings"))
 
         try:
-            investees = [InvesteesEarnings(**d) for d in json.loads(investee_json)]
+            raw = investee_json
+            items = json.loads(raw) if isinstance(raw, str) else (raw or [])
+            investees = []
+            for it in items:
+                try:
+                    investees.append(
+                        InvesteesEarnings(
+                            name=str(it.get("name","")),
+                            ownership_pct=float(it.get("ownership_pct", 0.0) or 0.0),
+                            net_income=float(it.get("net_income", 0.0) or 0.0),
+                            dividends_received=float(it.get("dividends_received", 0.0) or 0.0),
+                        )
+                    )
+                except Exception:
+                    continue
         except Exception:
             investees = []
-        lt = look_through_earnings(operating_earnings=float(ebit), investees=investees)
+        lt = look_through_earnings(operating_earnings=float(oe_final), investees=investees)
         st.metric("Look-Through Earnings (Buffett 1991)", fmt_money_short(lt))
 
         manufacturing = st.toggle("Manufacturing?", value=False)
@@ -772,6 +847,10 @@ def main():
         st.metric("Contrarian Overlay (multiplier)", f"x{mult:.3f}", help=H("contrarian"))
 
         oe_ratio = np.clip(oe_final / sales, -1.0, 1.0) if sales > 0 else 0.0
+
+        if "lt" not in locals():
+            lt = float(oe_final)
+
         lt_ratio = np.clip(lt / max(sales, 1e-9), -1.0, 1.0)
 
         base = (
@@ -850,7 +929,7 @@ def main():
         if (not math.isnan(mdd) and mdd > 0.7) or (z < 1.1):
             st.warning("Caution: very high drawdown history and/or low Altman Z detected. Investigate solvency/liquidity risk.")
 
-        if st.button("Export Report to PDF", key="btn_export_pdf"):
+        if st.button("Export Report to PDF"):
             metrics = {
                 "Owner Earnings": fmt_money_short(oe_final),
                 "Look-Through Earnings": fmt_money_short(lt),
@@ -862,7 +941,7 @@ def main():
             pdf_file = export_pdf(f"{ticker}_report.pdf", ticker, buffett_score, metrics)
             st.success(f"Exported to {pdf_file}")
             with open(pdf_file, "rb") as f:
-                st.download_button("Download PDF", f, file_name=f"{ticker}_report.pdf", mime="application/pdf", key="btn_dl_pdf")
+                st.download_button("Download PDF", f, file_name=f"{ticker}_report.pdf", mime="application/pdf")
 
     # ---- Compile company data for ChatGPT context ----
     company_data = get_current_company_data(
