@@ -288,9 +288,9 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
 
 # --- End of render_auth_ui ---
 
-# Backward-compat convenience
+# --- Begin require_auth ---
 def require_auth():
-    """Call this at the top of your app page to force sign-in."""
-    render_auth_ui()
     if not is_authenticated():
+        render_auth_ui()   # render only when not authenticated
         st.stop()
+# --- End of require_auth ---

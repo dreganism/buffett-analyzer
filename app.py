@@ -41,6 +41,20 @@ def _as_df(x):
 
 from report import export_pdf
 
+# --- Background colors ---
+st.markdown(
+    """
+    <style>
+    /* Change entire app background */
+    .stApp {
+        background-color: #f8f1e4;  /* ← pick your desert tone */
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+# --- End background colors ---
+
 # ChatGPT integration (auto-load modal)
 from chatgpt_integration import ChatGPTIntegration, render_chatgpt_modal
 
@@ -599,19 +613,10 @@ def main():
     with st.sidebar:
         st.header("Account")
         if AUTH_AVAILABLE:
-            render_auth_ui()  # renders Sign in / handles callback
-            if not is_authenticated():
-                st.info("Please sign in with Google to continue.")
-                st.stop()
-            u = current_user() or {}
-            st.caption(f"Signed in: {u.get('email','')}")
-            if st.button("Sign out"):
-                try:
-                    logout()
-                finally:
-                    st.rerun()
+            # Single source of truth: all sign-in/out UI lives in auth_manager.render_auth_ui
+            render_auth_ui()
         else:
-            st.warning("Auth not configured; running in open mode.")
+            st.info("Auth not configured; running in open mode.")
 
     # Initialize ChatGPT integration
     if "chatgpt_integration" not in st.session_state:
