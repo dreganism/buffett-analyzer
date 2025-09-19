@@ -24,7 +24,150 @@ import os
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
 import streamlit as st
+# --- Optional searchbox widget ---
+try:
+    from streamlit_searchbox import st_searchbox
+    HAS_SEARCHBOX = True
+except Exception:
+    HAS_SEARCHBOX = False
+# --- End optional searchbox ---
 
+# === Symbol lookup utilities (incremental search) ===
+SYMBOLS_DIR = "/root/projects/buffett-analyzer/exchange_ticker_list"
+
+@st.cache_data(ttl=24*60*60, show_spinner=False)
+def load_symbol_table():
+    """
+    Load a symbols lookup table from SYMBOLS_DIR.
+    Expected 'symbols.csv' or the newest '*.csv' in the directory.
+    Required cols: ticker, name. Optional: exchange.
+    Cache auto-invalidates when file mtime changes.
+    """
+    import pandas as pd, os
+    from glob import glob
+
+    # Resolve CSV path
+    csv_path = os.path.join(SYMBOLS_DIR, "symbols.csv")
+    if not os.path.exists(csv_path):
+        cands = sorted(glob(os.path.join(SYMBOLS_DIR, "*.csv")), key=os.path.getmtime, reverse=True)
+        if cands:
+            csv_path = cands[0]
+
+    if not os.path.exists(csv_path):
+        st.info("Using built-in sample symbol list. Add a 'symbols.csv' to SYMBOLS_DIR.", icon="ℹ️")
+        fallback = pd.DataFrame([
+            {"ticker":"AAPL","name":"Apple Inc.","exchange":"NASDAQ"},
+            {"ticker":"MSFT","name":"Microsoft Corporation","exchange":"NASDAQ"},
+            {"ticker":"GOOGL","name":"Alphabet Inc. Class A","exchange":"NASDAQ"},
+            {"ticker":"AMZN","name":"Amazon.com, Inc.","exchange":"NASDAQ"},
+            {"ticker":"BRK.B","name":"Berkshire Hathaway Inc. Class B","exchange":"NYSE"},
+            {"ticker":"TSLA","name":"Tesla, Inc.","exchange":"NASDAQ"},
+            {"ticker":"NVDA","name":"NVIDIA Corporation","exchange":"NASDAQ"},
+            {"ticker":"META","name":"Meta Platforms, Inc. Class A","exchange":"NASDAQ"},
+        ])
+        return fallback
+
+    # include file mtime in cache key (via helper arg) so cache busts on nightly update
+    mtime = os.path.getmtime(csv_path)
+    return _load_symbol_csv(csv_path, mtime)
+def _load_symbol_csv(csv_path: str, _mtime_key: float):
+    import pandas as pd
+
+    # 1) Try to auto-detect delimiter (TSV/CSV/semicolon); fall back to comma
+    try:
+        df = pd.read_csv(csv_path, sep=None, engine="python")
+    except Exception:
+        df = pd.read_csv(csv_path)
+
+    # 2) Normalize header names
+    norm = {c: str(c).strip().lower().replace(" ", "_") for c in df.columns}
+    df.rename(columns=norm, inplace=True)
+    cols = set(df.columns)
+
+    # 3) Accept common aliases
+    ticker_aliases = [
+        "ticker", "symbol", "security_symbol", "instrument", "code",
+        "ticker_symbol", "root"
+    ]
+    name_aliases = [
+        "name", "company", "company_name", "security_name", "description",
+        "longname", "long_name", "security", "companyname"
+    ]
+    exch_aliases = [
+        "exchange", "mic", "market", "primary_exchange",
+        "listing_exchange", "venue"
+    ]
+
+    def pick(candidates):
+        for c in candidates:
+            if c in cols:
+                return c
+        return None
+
+    tcol = pick(ticker_aliases)
+    ncol = pick(name_aliases)
+    xcol = pick(exch_aliases)
+
+    # 4) If still missing, try a last-ditch heuristic: first col = ticker, second = name
+    if tcol is None or ncol is None:
+        if len(df.columns) >= 2:
+            tcol = tcol or list(df.columns)[0]
+            ncol = ncol or list(df.columns)[1]
+        else:
+            # Surface exact columns so you can adjust your nightly export
+            raise ValueError(
+                "CSV must have 'ticker' and 'name' columns (or equivalents). "
+                f"Found columns: {sorted(cols)}"
+            )
+
+    out = pd.DataFrame({
+        "ticker": df[tcol].astype(str).str.strip(),
+        "name":   df[ncol].astype(str).str.strip(),
+        "exchange": df[xcol].astype(str).str.strip() if xcol else ""
+    })
+
+    # Normalize common ticker quirks (BRK/B → BRK.B)
+    out["ticker"] = (out["ticker"]
+                     .str.replace("/", ".", regex=False)
+                     .str.replace("\\", ".", regex=False))
+
+    # Drop empties/dupes
+    out = out.replace({"ticker": {"": None}, "name": {"": None}}).dropna(subset=["ticker", "name"])
+    out = out.drop_duplicates(subset=["ticker", "name"])
+
+    return out[["ticker", "name", "exchange"]]
+
+# def _load_symbol_csv(csv_path: str, _mtime_key: float):
+#     import pandas as pd
+#     df = pd.read_csv(csv_path)
+#     df.columns = [c.strip().lower() for c in df.columns]
+#     if "ticker" not in df.columns or "name" not in df.columns:
+#         raise ValueError("CSV must have 'ticker' and 'name' columns.")
+#     if "exchange" not in df.columns:
+#         df["exchange"] = ""
+#     df["ticker"] = df["ticker"].astype(str).str.strip()
+#     df["name"] = df["name"].astype(str).str.strip()
+#     df["exchange"] = df["exchange"].astype(str).str.strip()
+#     return df[["ticker","name","exchange"]].dropna().drop_duplicates()
+
+def search_symbols(query: str, limit: int = 10):
+    import pandas as pd
+    df = load_symbol_table()
+    q = (query or "").strip()
+    if not q:
+        return pd.DataFrame(columns=df.columns)
+    ql = q.lower()
+    ticker = df["ticker"].astype(str); name = df["name"].astype(str)
+    t_low = ticker.str.lower(); n_low = name.str.lower()
+    score = (
+        (t_low.str.startswith(ql))*100 +
+        (n_low.str.startswith(ql))*80 +
+        (t_low.str.contains(ql, regex=False))*40 +
+        (n_low.str.contains(ql, regex=False))*20
+    )
+    res = df.assign(_score=score).query("_score > 0").sort_values(by=["_score","ticker"], ascending=[False, True]).head(limit)
+    return res.drop(columns=["_score"])
+# === End symbol lookup utilities ===
 
 def _as_df(x):
     import pandas as pd
@@ -725,7 +868,107 @@ def main():
 
         render_data_quality_flags()
 
-        ticker = st.text_input("Ticker", key="inp_ticker", help=H("ticker"))
+        # ticker = st.text_input("Ticker", key="inp_ticker", help=H("ticker"), on_change=fetch_and_fill_from_yahoo) # Auto fetch on change
+        # --- Ticker with in-input look-ahead ---
+        def _symbol_search_provider(searchterm: str) -> list[tuple[str, str]]:
+            """
+            Adapter for st_searchbox:
+            - Returns a list of (value, label) tuples.
+            - value  = ticker (normalized, uppercased)
+            - label  = "TICKER — Company Name (EXCHANGE)"  (exchange omitted if blank)
+            """
+            q = (searchterm or "").strip()
+            if len(q) < 2:
+                return []
+
+            try:
+                df = search_symbols(q, limit=20).copy()
+            except Exception as e:
+                st.warning(f"Symbol search failed: {e}")
+                return []
+
+            if df is None or df.empty:
+                return []
+
+            # Ensure required columns exist; fill if missing
+            for col in ("ticker", "name", "exchange"):
+                if col not in df.columns:
+                    df[col] = ""
+
+            # Normalize types/values
+            df["ticker"] = df["ticker"].astype(str).str.strip().str.upper()
+            df["name"] = df["name"].astype(str).str.strip()
+            df["exchange"] = df["exchange"].astype(str).str.strip()
+
+            # Build labels
+            display = df["ticker"] + " — " + df["name"] + df["exchange"].apply(lambda x: f" ({x})" if x else "")
+
+            # Return (value, label) for st_searchbox
+            return list(zip(df["ticker"].tolist(), display.tolist()))
+
+
+        prev_selected = st.session_state.get("_last_selected_ticker")
+        st.caption("Ticker")  # visual label (searchbox renders without a label)
+        if HAS_SEARCHBOX:
+            # Primary: in-input autocomplete
+            selected_ticker = st_searchbox(
+                search_function=_symbol_search_provider,
+                placeholder="Type ticker or company name…",
+                key="ticker_searchbox",
+            )
+            # selected_ticker is the tuple's first element (value) when user chooses an item
+            if selected_ticker and selected_ticker != st.session_state.get("_last_selected_ticker"):
+                st.session_state["_last_selected_ticker"] = str(selected_ticker)
+                st.session_state["inp_ticker"] = str(selected_ticker)
+                try:
+                    fetch_and_fill_from_yahoo()
+                except Exception as e:
+                    st.warning(f"Auto-fetch failed for {selected_ticker}: {e}")
+                # Streamlit reruns automatically on widget interaction
+        else:
+            # Fallback: native selectbox that filters as you type (no live dropdown per keystroke)
+            df_all = load_symbol_table()
+            options = (
+                df_all["ticker"].astype(str)
+                + " — " + df_all["name"].astype(str)
+                + df_all["exchange"].apply(lambda x: f" ({x})" if str(x).strip() else "")
+            ).tolist()
+            choice = st.selectbox(
+                "Type to search…",
+                options=options,
+                index=None,
+                placeholder="Type ticker or company name…",
+            )
+            if choice:
+                # Extract ticker = text before " — "
+                chosen_ticker = choice.split(" — ", 1)[0]
+                if chosen_ticker != st.session_state.get("_last_selected_ticker"):
+                    st.session_state["_last_selected_ticker"] = chosen_ticker
+                    st.session_state["inp_ticker"] = chosen_ticker
+                try:
+                    fetch_and_fill_from_yahoo()
+                except Exception as e:
+                    st.warning(f"Auto-fetch failed for {chosen_ticker}: {e}")
+                # Streamlit reruns automatically on widget interaction
+
+        
+        # # -- live suggestions as user types --
+        # q = str(st.session_state.get("inp_ticker") or "").strip()
+        # if len(q) >= 2:
+        #     sugg = search_symbols(q, limit=8)
+        #     if not sugg.empty:
+        #         with st.container():
+        #             st.caption("Suggestions")
+        #             for idx, row in sugg.reset_index(drop=True).iterrows():
+        #                 label = f"{row['ticker']} — {row['name']}"
+        #                 key = f"suggest_{row['ticker']}_{row.get('exchange','')}_{idx}"
+        #                 if st.button(label, key=key, help=row.get("exchange", "")):
+        #                     st.session_state["inp_ticker"] = str(row["ticker"])
+        #                     try:
+        #                         fetch_and_fill_from_yahoo()
+        #                     except Exception as e:
+        #                         st.warning(f"Auto-fetch failed for {row['ticker']}: {e}")
+        #                     st.rerun()
         sector = st.text_input("Sector (manual or from your DB)", key="inp_sector", help=H("sector"))
         industry = st.text_input("Industry (manual or from your DB)", key="inp_industry", help=H("industry"))
 
@@ -752,6 +995,10 @@ def main():
         )
 
     # ---------- Right column ----------
+    # Ensure 'ticker' exists even if the left input didn't run due to prior errors
+    # --- fallback to inp_ticker --
+    ticker = st.session_state.get('inp_ticker', '')
+    # --- end fallback ---
     with colR:
         st.subheader("Process")
 
