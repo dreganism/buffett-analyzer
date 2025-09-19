@@ -45,13 +45,44 @@ from report import export_pdf
 st.markdown(
     """
     <style>
-    /* Change entire app background */
+    /* App background */
     .stApp {
-        background-color: #f8f1e4;  /* ← pick your desert tone */
+        background-color: #f8f1e4;  /* desert tone */
+    }
+
+    /* Robust styling for all link_button widgets */
+    [data-testid="stLinkButton"] > a,
+    [data-testid="stLinkButton"] > button,
+    .stLinkButton > a,
+    .stLinkButton > button {
+        background-color: #422EEF !important;   /* home-page blue */
+        color: #ffffff !important;
+        border: 1px solid #422EEF !important;
+        box-shadow: none !important;
+        text-decoration: none !important;
+    }
+
+    [data-testid="stLinkButton"] > a:hover,
+    [data-testid="stLinkButton"] > button:hover,
+    .stLinkButton > a:hover,
+    .stLinkButton > button:hover,
+    [data-testid="stLinkButton"] > a:focus,
+    [data-testid="stLinkButton"] > button:focus,
+    .stLinkButton > a:focus,
+    .stLinkButton > button:focus,
+    [data-testid="stLinkButton"] > a:active,
+    [data-testid="stLinkButton"] > button:active,
+    .stLinkButton > a:active,
+    .stLinkButton > button:active {
+        background-color: #2E7BEF !important;   /* hover blue */
+        border-color: #2E7BEF !important;
+        color: #ffffff !important;
+        box-shadow: none !important;
+        outline: none !important;
     }
     </style>
     """,
-    unsafe_allow_html=True
+    unsafe_allow_html=True,
 )
 # --- End background colors ---
 
@@ -60,7 +91,7 @@ from chatgpt_integration import ChatGPTIntegration, render_chatgpt_modal
 
 # Google OAuth helpers (new lightweight auth)
 try:
-    from auth_manager import render_auth_ui, is_authenticated, current_user, logout
+    from auth_manager import render_auth_ui, is_authenticated, current_user, logout, require_auth
     AUTH_AVAILABLE = True
 except Exception as e:
     print(f"Auth functions not available: {e}")
@@ -607,6 +638,12 @@ def _pick_price_series(df: pd.DataFrame):
 
 def main():
     st.set_page_config(page_title="Buffett Analyzer — Extended", layout="wide")
+    # --- Authentication gate (must be signed in before anything renders) ---
+    if not AUTH_AVAILABLE:
+        st.error('Authentication is required but not configured. Set GOOGLE_* env vars and restart.')
+        st.stop()
+    require_auth()  # Renders Google sign-in if needed and stops the app until authenticated
+    # --- End authentication gate ---
     init_defaults()  # MUST run before any widgets are created
 
     # --- Account / Authentication (sidebar) ---

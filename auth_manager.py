@@ -1,8 +1,6 @@
-# UPDATED 2025-09-13 19:32:48Z — Fixes: unique Streamlit keys, OAuth client_secret, st.query_params, clear URL params, remove duplicate Sign out
-# auth_manager.py
+# Working corrected auth_manager.py — saved 2025-09-19 14:57:37Z
 # Google OAuth for Streamlit with robust state handling (HMAC-signed, time-bound) and PKCE support.
 # Fixes common "OAuth state mismatch" by avoiding reliance on ephemeral Streamlit session state.
-
 from __future__ import annotations
 
 import base64
@@ -11,14 +9,21 @@ import hmac
 import json
 import os
 import secrets
-import time
+import time as _time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-import requests
 import streamlit as st
-from dotenv import load_dotenv, find_dotenv
 from urllib.parse import urlencode, urlparse, urlunparse
+
+# dotenv is optional; tolerate absence without crashing at import time
+try:
+    from dotenv import load_dotenv, find_dotenv
+except Exception:
+    def load_dotenv(*args, **kwargs):
+        return False
+    def find_dotenv(*args, **kwargs):
+        return ""
 
 # -----------------------------------------------------------------------------
 # Load env
@@ -36,6 +41,15 @@ STATE_TTL_SECONDS = 10 * 60  # 10 minutes default
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
+def _rq():
+    """Lazy import of 'requests' to avoid import-time failure if not installed."""
+    import importlib
+    try:
+        return importlib.import_module("requests")
+    except Exception as e:
+        st.error(f"The 'requests' package is required for Google OAuth: {e}")
+        raise
+
 def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
     if v:
@@ -48,15 +62,12 @@ def _get_env(name: str, default: Optional[str] = None) -> Optional[str]:
         pass
     return default
 
-
 def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
-
 
 def _b64url_decode(s: str) -> bytes:
     pad = "=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s + pad)
-
 
 def _sign_state(payload: Dict[str, str], secret: str) -> str:
     """
@@ -70,7 +81,6 @@ def _sign_state(payload: Dict[str, str], secret: str) -> str:
     sig = hmac.new(secret.encode("utf-8"), to_sign, hashlib.sha256).digest()
     return ".".join([_b64url(j_header), _b64url(j_payload), _b64url(sig)])
 
-
 def _verify_state(state_token: str, secret: str, ttl_seconds: int = STATE_TTL_SECONDS) -> Tuple[bool, Optional[Dict]]:
     try:
         parts = state_token.split(".")
@@ -83,12 +93,11 @@ def _verify_state(state_token: str, secret: str, ttl_seconds: int = STATE_TTL_SE
             return False, None
         payload = json.loads(_b64url_decode(payload_b64))
         ts = int(payload.get("ts", 0))
-        if int(time.time()) - ts > ttl_seconds:
+        if int(_time.time()) - ts > ttl_seconds:
             return False, None
         return True, payload
     except Exception:
         return False, None
-
 
 def _build_redirect_uri() -> str:
     """
@@ -105,16 +114,43 @@ def _build_redirect_uri() -> str:
     parsed = urlparse(redir)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
-
 def _pkce_pair() -> Tuple[str, str]:
-    """
-    Generate (code_verifier, code_challenge) pair for PKCE S256.
-    """
+    """Generate (code_verifier, code_challenge) pair for PKCE S256."""
     verifier = _b64url(secrets.token_bytes(32))
     digest = hashlib.sha256(verifier.encode("ascii")).digest()
     challenge = _b64url(digest)
     return verifier, challenge
 
+# --- Streamlit URL param compatibility helpers ---
+def _get_query_params():
+    # Prefer new API
+    try:
+        return dict(st.query_params)
+    except Exception:
+        pass
+    # Fallback to experimental API (older Streamlit)
+    try:
+        return dict(st.experimental_get_query_params())
+    except Exception:
+        return {}
+
+def _clear_oauth_params():
+    # Try new API mutation
+    try:
+        for k in ("code", "state", "scope", "authuser", "prompt"):
+            if hasattr(st, "query_params") and k in st.query_params:
+                del st.query_params[k]
+        return
+    except Exception:
+        pass
+    # Fallback to experimental API rewrite
+    try:
+        qp = dict(st.experimental_get_query_params())
+        for k in ("code", "state", "scope", "authuser", "prompt"):
+            qp.pop(k, None)
+        st.experimental_set_query_params(**qp)
+    except Exception:
+        pass
 
 @dataclass
 class GoogleTokens:
@@ -130,29 +166,18 @@ class GoogleTokens:
 def is_authenticated() -> bool:
     return bool(st.session_state.get("google_user"))
 
-
 def current_user() -> Optional[Dict]:
     return st.session_state.get("google_user")
-
-
-def _clear_oauth_params():
-    # Clean query params so refresh doesn't re-trigger auth
-    try:
-        for k in ("code", "state", "scope", "authuser", "prompt"):
-            if k in st.query_params:
-                del st.query_params[k]
-    except Exception:
-        pass
-
 
 def logout():
     st.session_state.pop("google_tokens", None)
     st.session_state.pop("google_user", None)
     _clear_oauth_params()
     st.success("You have been signed out.")
-
+    st.rerun()
 
 def _exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: Optional[str]) -> GoogleTokens:
+    rq = _rq()
     cid = _get_env("GOOGLE_CLIENT_ID", "")
     csec = _get_env("GOOGLE_CLIENT_SECRET", "")
     data = {
@@ -167,7 +192,7 @@ def _exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: Optio
     if csec:
         data["client_secret"] = csec
 
-    resp = requests.post(GOOGLE_TOKEN_ENDPOINT, data=data, timeout=10)
+    resp = rq.post(GOOGLE_TOKEN_ENDPOINT, data=data, timeout=10)
     resp.raise_for_status()
     js = resp.json()
     return GoogleTokens(
@@ -178,9 +203,9 @@ def _exchange_code_for_tokens(code: str, redirect_uri: str, code_verifier: Optio
         token_type=js.get("token_type", "Bearer"),
     )
 
-
 def _fetch_userinfo(access_token: str) -> Dict:
-    r = requests.get(
+    rq = _rq()
+    r = rq.get(
         GOOGLE_USERINFO_ENDPOINT,
         headers={"Authorization": f"Bearer {access_token}"},
         timeout=10,
@@ -194,8 +219,7 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
     Sidebar UI:
       - If callback params present (code/state) -> complete OAuth, store user, clear URL.
       - If signed in -> show name/email + 'Sign out' button.
-      - Else -> show ONE 'Sign in with Google' button that is a direct link
-        (st.link_button) to the Google OAuth URL — no separate text link.
+      - Else -> show ONE 'Sign in with Google' button that is a direct link to Google OAuth.
     """
     cid = _get_env("GOOGLE_CLIENT_ID")
     csec = _get_env("GOOGLE_CLIENT_SECRET")
@@ -212,11 +236,12 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
         st.error(str(e))
         return
 
-    # 1️⃣ Handle OAuth callback if Google sent us ?code=…&state=…
+    # 1) Handle OAuth callback if Google sent us ?code=…&state=…
+    qp = {}
     try:
-        qp = dict(st.query_params)
+        qp = _get_query_params()
     except Exception:
-        qp = {}
+        pass
 
     code = qp.get("code")
     state = qp.get("state")
@@ -226,7 +251,7 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
         if not valid:
             st.error("OAuth state mismatch. Please try again.")
         else:
-            code_verifier = payload.get("pkce")  # PKCE verifier stored in signed state
+            code_verifier = payload.get("pkce")
             try:
                 tokens = _exchange_code_for_tokens(code, redirect_uri, code_verifier)
                 st.session_state["google_tokens"] = tokens.__dict__
@@ -239,12 +264,12 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
                 }
                 _clear_oauth_params()
                 st.success(f"Signed in as {userinfo.get('email')}")
-            except requests.HTTPError as e:
-                st.error(f"Token exchange failed: {e.response.text if e.response is not None else e}")
+                st.rerun()
             except Exception as e:
-                st.error(f"Unexpected error during auth: {e}")
+                body = getattr(getattr(e, "response", None), "text", None)
+                st.error(f"Token exchange failed: {body or e}")
 
-    # 2️⃣ If already authenticated: show user + Sign out
+    # 2) If already authenticated: show user + Sign out
     if is_authenticated():
         u = current_user() or {}
         cols = st.columns([1, 3, 2])
@@ -259,13 +284,13 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
                 logout()
         return
 
-    # 3️⃣ Not authenticated: show ONE clickable button that links directly to Google OAuth
+    # 3) Not authenticated: show a direct link to Google OAuth (with PKCE + signed state)
     verifier, challenge = _pkce_pair()
     payload = {
-        "ts": int(time.time()),
+        "ts": int(_time.time()),
         "nonce": _b64url(secrets.token_bytes(12)),
         "app": "buffett-analyzer",
-        "pkce": verifier,  # include verifier in signed state; we’ll read it after redirect
+        "pkce": verifier,
     }
     signed_state = _sign_state(payload, csec or cid)
 
@@ -282,11 +307,17 @@ def render_auth_ui(button_label: str = "Sign in with Google"):
         "code_challenge_method": "S256",
     }
     auth_url = f"{GOOGLE_AUTH_ENDPOINT}?{urlencode(auth_params)}"
+    # --- Google Logon Button ---
+    # create three columns; middle one is the widest
+    cols = st.columns([1, 2, 1])
 
-    # 🔵 CSP-safe: Streamlit 1.32+ link_button renders a styled button that’s a direct link.
-    st.link_button(button_label, auth_url, use_container_width=True)
-
-# --- End of render_auth_ui ---
+    with cols[1]:               # everything in this block is centered
+        st.link_button(button_label, auth_url)
+        st.link_button(
+            "🏠 Back to Buffett-Analyzer Home",
+            "https://buffett-analyzer.investments",
+        )
+    # --- End --- Google Logon Button ---
 
 # --- Begin require_auth ---
 def require_auth():
