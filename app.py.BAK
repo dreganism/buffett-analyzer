@@ -1,0 +1,1176 @@
+# app.py
+# Buffett Analyzer — Extended (Python + Streamlit)
+# Includes: Circle of Competence, Owner Earnings (+ optional ΔWC), Altman Z/Drawdown/Vol risk,
+# Contrarian overlay, Look-Through Earnings, Greenwald Maintenance CapEx with real 5y history
+# Author: David Regan (dphackworth)
+
+from yahoo_adapter import (
+    fetch_prices_daily,
+    fetch_intraday_1m,
+    fetch_fundamentals,
+    fetch_profile,
+    fetch_market_cap,
+    fetch_greenwald_history,
+    fetch_working_capital_quarterly,
+)
+import math
+import json
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import os
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
+import streamlit as st
+try:
+    from streamlit_searchbox import st_searchbox
+    HAS_SEARCHBOX = True
+except Exception:
+    HAS_SEARCHBOX = False
+
+
+
+
+# === Symbol lookup utilities (incremental search) ===
+SYMBOLS_DIR = "/root/projects/buffett-analyzer/exchange_ticker_list"
+
+@st.cache_data(ttl=24*60*60, show_spinner=False)
+def load_symbol_table():
+    """
+    Load a symbols lookup table from SYMBOLS_DIR.
+    Expected 'symbols.csv' or the newest '*.csv' in the directory.
+    Required cols: ticker, name. Optional: exchange.
+    Cache auto-invalidates when file mtime changes.
+    """
+    import pandas as pd, os
+    from glob import glob
+
+    # Resolve CSV path
+    csv_path = os.path.join(SYMBOLS_DIR, "symbols.csv")
+    if not os.path.exists(csv_path):
+        cands = sorted(glob(os.path.join(SYMBOLS_DIR, "*.csv")), key=os.path.getmtime, reverse=True)
+        if cands:
+            csv_path = cands[0]
+
+    if not os.path.exists(csv_path):
+        st.info("Using built-in sample symbol list. Add a 'symbols.csv' to SYMBOLS_DIR.", icon="ℹ️")
+        fallback = pd.DataFrame([
+            {"ticker":"AAPL","name":"Apple Inc.","exchange":"NASDAQ"},
+            {"ticker":"MSFT","name":"Microsoft Corporation","exchange":"NASDAQ"},
+            {"ticker":"GOOGL","name":"Alphabet Inc. Class A","exchange":"NASDAQ"},
+            {"ticker":"AMZN","name":"Amazon.com, Inc.","exchange":"NASDAQ"},
+            {"ticker":"BRK.B","name":"Berkshire Hathaway Inc. Class B","exchange":"NYSE"},
+            {"ticker":"TSLA","name":"Tesla, Inc.","exchange":"NASDAQ"},
+            {"ticker":"NVDA","name":"NVIDIA Corporation","exchange":"NASDAQ"},
+            {"ticker":"META","name":"Meta Platforms, Inc. Class A","exchange":"NASDAQ"},
+        ])
+        return fallback
+
+    # include file mtime in cache key (via helper arg) so cache busts on nightly update
+    mtime = os.path.getmtime(csv_path)
+    return _load_symbol_csv(csv_path, mtime)
+def _load_symbol_csv(csv_path: str, _mtime_key: float):
+    import pandas as pd
+
+    # 1) Try to auto-detect delimiter (TSV/CSV/semicolon); fall back to comma
+    try:
+        df = pd.read_csv(csv_path, sep=None, engine="python")
+    except Exception:
+        df = pd.read_csv(csv_path)
+
+    # 2) Normalize header names
+    norm = {c: str(c).strip().lower().replace(" ", "_") for c in df.columns}
+    df.rename(columns=norm, inplace=True)
+    cols = set(df.columns)
+
+    # 3) Accept common aliases
+    ticker_aliases = [
+        "ticker", "symbol", "security_symbol", "instrument", "code",
+        "ticker_symbol", "root"
+    ]
+    name_aliases = [
+        "name", "company", "company_name", "security_name", "description",
+        "longname", "long_name", "security", "companyname"
+    ]
+    exch_aliases = [
+        "exchange", "mic", "market", "primary_exchange",
+        "listing_exchange", "venue"
+    ]
+
+    def pick(candidates):
+        for c in candidates:
+            if c in cols:
+                return c
+        return None
+
+    tcol = pick(ticker_aliases)
+    ncol = pick(name_aliases)
+    xcol = pick(exch_aliases)
+
+    # 4) If still missing, try a last-ditch heuristic: first col = ticker, second = name
+    if tcol is None or ncol is None:
+        if len(df.columns) >= 2:
+            tcol = tcol or list(df.columns)[0]
+            ncol = ncol or list(df.columns)[1]
+        else:
+            # Surface exact columns so you can adjust your nightly export
+            raise ValueError(
+                "CSV must have 'ticker' and 'name' columns (or equivalents). "
+                f"Found columns: {sorted(cols)}"
+            )
+
+    out = pd.DataFrame({
+        "ticker": df[tcol].astype(str).str.strip(),
+        "name":   df[ncol].astype(str).str.strip(),
+        "exchange": df[xcol].astype(str).str.strip() if xcol else ""
+    })
+
+    # Normalize common ticker quirks (BRK/B → BRK.B)
+    out["ticker"] = (out["ticker"]
+                     .str.replace("/", ".", regex=False)
+                     .str.replace("\\", ".", regex=False))
+
+    # Drop empties/dupes
+    out = out.replace({"ticker": {"": None}, "name": {"": None}}).dropna(subset=["ticker", "name"])
+    out = out.drop_duplicates(subset=["ticker", "name"])
+
+    return out[["ticker", "name", "exchange"]]
+
+# def _load_symbol_csv(csv_path: str, _mtime_key: float):
+#     import pandas as pd
+#     df = pd.read_csv(csv_path)
+#     df.columns = [c.strip().lower() for c in df.columns]
+#     if "ticker" not in df.columns or "name" not in df.columns:
+#         raise ValueError("CSV must have 'ticker' and 'name' columns.")
+#     if "exchange" not in df.columns:
+#         df["exchange"] = ""
+#     df["ticker"] = df["ticker"].astype(str).str.strip()
+#     df["name"] = df["name"].astype(str).str.strip()
+#     df["exchange"] = df["exchange"].astype(str).str.strip()
+#     return df[["ticker","name","exchange"]].dropna().drop_duplicates()
+
+def search_symbols(query: str, limit: int = 10):
+    import pandas as pd
+    df = load_symbol_table()
+    q = (query or "").strip()
+    if not q:
+        return pd.DataFrame(columns=df.columns)
+    ql = q.lower()
+    ticker = df["ticker"].astype(str); name = df["name"].astype(str)
+    t_low = ticker.str.lower(); n_low = name.str.lower()
+    score = (
+        (t_low.str.startswith(ql))*100 +
+        (n_low.str.startswith(ql))*80 +
+        (t_low.str.contains(ql, regex=False))*40 +
+        (n_low.str.contains(ql, regex=False))*20
+    )
+    res = df.assign(_score=score).query("_score > 0").sort_values(by=["_score","ticker"], ascending=[False, True]).head(limit)
+    return res.drop(columns=["_score"])
+# === End symbol lookup utilities ===
+
+def _as_df(x):
+    import pandas as pd
+    if x is None:
+        return pd.DataFrame()
+    if isinstance(x, pd.DataFrame):
+        return x
+    if isinstance(x, pd.Series):
+        return x.to_frame()
+    try:
+        return pd.DataFrame(x)
+    except Exception:
+        return pd.DataFrame()
+
+from report import export_pdf
+
+# --- Background colors ---
+st.markdown(
+    """
+    <style>
+    /* App background */
+    .stApp {
+        background-color: #f8f1e4;  /* desert tone */
+    }
+
+    /* Robust styling for all link_button widgets */
+    [data-testid="stLinkButton"] > a,
+    [data-testid="stLinkButton"] > button,
+    .stLinkButton > a,
+    .stLinkButton > button {
+        background-color: #422EEF !important;   /* home-page blue */
+        color: #ffffff !important;
+        border: 1px solid #422EEF !important;
+        box-shadow: none !important;
+        text-decoration: none !important;
+    }
+
+    [data-testid="stLinkButton"] > a:hover,
+    [data-testid="stLinkButton"] > button:hover,
+    .stLinkButton > a:hover,
+    .stLinkButton > button:hover,
+    [data-testid="stLinkButton"] > a:focus,
+    [data-testid="stLinkButton"] > button:focus,
+    .stLinkButton > a:focus,
+    .stLinkButton > button:focus,
+    [data-testid="stLinkButton"] > a:active,
+    [data-testid="stLinkButton"] > button:active,
+    .stLinkButton > a:active,
+    .stLinkButton > button:active {
+        background-color: #2E7BEF !important;   /* hover blue */
+        border-color: #2E7BEF !important;
+        color: #ffffff !important;
+        box-shadow: none !important;
+        outline: none !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+# --- End background colors ---
+
+# ChatGPT integration (auto-load modal)
+from chatgpt_integration import ChatGPTIntegration, render_chatgpt_modal
+
+# Google OAuth helpers (new lightweight auth)
+try:
+    from auth_manager import render_auth_ui, is_authenticated, current_user, logout, require_auth
+    AUTH_AVAILABLE = True
+except Exception as e:
+    print(f"Auth functions not available: {e}")
+    AUTH_AVAILABLE = False
+
+# Utility values and functions
+SHOW_CHATGPT_DEBUG = False
+
+# -----------------------------
+# ---------- GLOSSARY ----------
+# -----------------------------
+GLOSSARY: Dict[str, str] = {
+    "circle_of_competence": "Your 'lane'—businesses and industries you truly understand. Buffett avoids investing outside this circle.",
+    "whitelist": "Sectors/industries you explicitly prefer to evaluate. Matching sector OR industry passes the gate.",
+    "blacklist": "Sectors/industries to exclude (e.g., pre-revenue biotech, SPACs). Matching entries fail the gate.",
+    "complexity_flags": "Quick exclusions for tricky categories like 'pre-revenue', 'binary-fda', 'exploration-only', 'crypto-miner'.",
+    "owner_earnings": "Buffett (1986): Owner Earnings ≈ Net Income + Depreciation & Amortization (+ other non-cash) − Maintenance CapEx.",
+    "maint_capex_method": "How we estimate maintenance CapEx (the spend needed to sustain current operations).",
+    "maint_dep_simple": "Assume Maintenance CapEx ≈ D&A. Simple and conservative when history is limited.",
+    "maint_greenwald": "Greenwald PPE/Sales proxy: Maintenance CapEx = Total CapEx − Growth CapEx (estimated from PPE/Sales and sales growth).",
+    "weights_section": "Weights for components of the Capital Preservation Score. We normalize internally.",
+    "w_z": "Importance of Altman Z (or Z'). Higher Z suggests lower bankruptcy risk.",
+    "w_mdd": "Importance of Max Drawdown (inverted). Lower historical drawdown → higher score.",
+    "w_vol": "Importance of Annualized Volatility (inverted). Lower volatility → higher score.",
+    "weights_autonorm": "Weights auto-normalize so their sum acts like 1.0.",
+    "contrarian": "Optional multiplier that slightly boosts score when markets look fearful.",
+    "fear_greed": "0–100 composite gauge (lower = fear). Small boost when < 30.",
+    "short_interest": "Short interest as fraction of float (e.g., 0.08 = 8%). Small boost at ≥ 8%.",
+    "news_sentiment": "Aggregated −1..+1 news sentiment. Small boost when ≤ −0.3.",
+    "put_call": "Put/Call ratio (>1 suggests fear). Small boost when > 1.0.",
+    "ticker": "Public ticker symbol (e.g., KO, AAPL). Used for prices and fundamentals.",
+    "sector": "High-level category (e.g., Consumer Staples). Used by circle-of-competence gate.",
+    "industry": "Specific industry (e.g., Beverages – Non-Alcoholic). Also used by the gate.",
+    "net_income": "Net income (TTM or last fiscal year).",
+    "da": "Depreciation & Amortization—non-cash charges added back in Owner Earnings.",
+    "capex_total": "Total capital expenditures (cash outflow for fixed assets).",
+    "sales": "Revenue (TTM or last fiscal year).",
+    "ppe": "Net Property, Plant & Equipment. Used by the Greenwald estimator.",
+    "working_capital": "Current Assets − Current Liabilities. Used in Altman Z.",
+    "retained_earnings": "Cumulative profits retained by the company. Used in Altman Z.",
+    "ebit": "Earnings Before Interest & Taxes. Used in Altman Z and as operating baseline.",
+    "equity_mkt_value": "Market capitalization; for private firms, use book equity.",
+    "total_assets": "Total assets on the balance sheet.",
+    "total_liabilities": "Total liabilities on the balance sheet.",
+    "investee_json": "Optional list for Look-Through Earnings: [{name, ownership_pct (0..1), net_income, dividends_received}].",
+    "altman_z": "Altman Z (or Z') combines five ratios to assess bankruptcy risk (Distress/Gray/Safe).",
+    "max_drawdown": "Worst peak-to-trough price decline over the period (positive fraction; 0.42 = −42%).",
+    "volatility": "Annualized standard deviation of daily returns (10Y).",
+    "capital_preservation": "Blend of Z-zone, inverse drawdown, and inverse volatility, weighted by your sliders.",
+    "buffett_score": "Illustrative composite blending circle-of-competence, Owner Earnings vs sales, capital preservation, and look-through.",
+    "delta_wc": "Change in Working Capital (latest period). Positive increases often represent required reinvestment; optionally subtract from OE.",
+}
+def H(key: str) -> str:
+    return GLOSSARY.get(key, "")
+
+# ------- GPT INTEGRATION -------
+def get_current_company_data(ticker: str, oe_final: float, lt: float, z: float, zone: str, 
+                           score_cprs: float, buffett_score: float, net_income: float, 
+                           sales: float) -> Dict:
+    """Compile current company data for ChatGPT context."""
+    return {
+        "ticker": ticker,
+        "net_income": fmt_money_short(net_income),
+        "sales": fmt_money_short(sales),
+        "owner_earnings": fmt_money_short(oe_final),
+        "look_through_earnings": fmt_money_short(lt),
+        "altman_z": f"{z:.2f} ({zone})",
+        "capital_preservation": f"{score_cprs * 100:.1f}/100",
+        "buffett_score": f"{buffett_score:.1f}/100",
+        "raw_net_income": net_income,
+        "raw_sales": sales,
+        "raw_owner_earnings": oe_final,
+        "raw_look_through": lt,
+        "raw_altman_z": z,
+        "raw_capital_preservation": score_cprs,
+        "raw_buffett_score": buffett_score
+    }
+
+# ------- FORMAT HELPERS -------
+def fmt_money_short(value: Optional[float], decimals: int = 1) -> str:
+    """Short-scale USD formatter: $1.2K / $3.4M / $5.6B / $1.2T; handles negatives & small numbers."""
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "N/A"
+        sign = "-" if value < 0 else ""
+        v = abs(float(value))
+        if v >= 1_000_000_000_000:
+            return f"{sign}${v/1_000_000_000_000:.{decimals}f}T"
+        if v >= 1_000_000_000:
+            return f"{sign}${v/1_000_000_000:.{decimals}f}B"
+        if v >= 1_000_000:
+            return f"{sign}${v/1_000_000:.{decimals}f}M"
+        if v >= 1_000:
+            return f"{sign}${v/1_000:.{decimals}f}K"
+        return f"{sign}${v:,.0f}"
+    except Exception:
+        return "N/A"
+
+def fmt_money_price(value: Optional[float]) -> str:
+    """Price-style USD: $123.45."""
+    try:
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return "N/A"
+        return f"${float(value):,.2f}"
+    except Exception:
+        return "N/A"
+
+def fmt_pct(frac: Optional[float], decimals: int = 1) -> str:
+    """Turn 0.1234 -> 12.3%"""
+    try:
+        if frac is None or (isinstance(frac, float) and math.isnan(frac)):
+            return "N/A"
+        return f"{float(frac)*100:.{decimals}f}%"
+    except Exception:
+        return "N/A"
+
+# ---- INPUT WIDGET HELPERS ----
+def money_number_input(label: str, key: str, step: float, help: str = "") -> float:
+    """Number input for money-like fields."""
+    val = st.number_input(label, step=step, key=key, help=help)
+    return val
+
+# ---- Data quality flags ----
+def render_data_quality_flags():
+    """Show gentle warnings when scraped/mapped values look implausible."""
+    s = st.session_state
+    msgs: List[str] = []
+    try:
+        sales_val = float(s.get("inp_sales") or 0.0)
+        ppe_val = float(s.get("inp_ppe") or 0.0)
+        if sales_val > 1e9 and ppe_val > 0 and ppe_val < 1e-5 * sales_val:
+            msgs.append(
+                f"**Net PP&E** {fmt_money_short(ppe_val)} looks unusually small relative to "
+                f"**Sales** {fmt_money_short(sales_val)} — verify statement mapping/aliases."
+            )
+    except Exception:
+        pass
+    try:
+        re_val = s.get("inp_re", None)
+        ni_val = s.get("inp_net_income", None)
+        if re_val is not None and ni_val is not None:
+            re_val = float(re_val)
+            ni_val = float(ni_val)
+            if re_val < -1e9 and ni_val > 0:
+                msgs.append(
+                    "**Retained Earnings** is strongly negative while **Net Income** is positive — "
+                    "double-check the 'Retained Earnings (Accumulated Deficit)' line."
+                )
+    except Exception:
+        pass
+    if msgs:
+        st.warning("Potential data quality issues:")
+        st.markdown("\n".join([f"- {m}" for m in msgs]))
+
+# -----------------------------
+# ---------- UTIL -------------
+# -----------------------------
+@st.cache_data
+def load_prices(ticker: str, years: int = 10) -> pd.Series:
+    """Fetch daily prices and return a 1-D float Series (prefer 'Close')."""
+    try:
+        data = fetch_prices_daily(ticker, years=years)
+        if data is None:
+            return pd.Series(dtype=float, name="price")
+        if isinstance(data, pd.DataFrame):
+            if data.empty:
+                return pd.Series(dtype=float, name="price")
+            if "Close" in data.columns:
+                s = data["Close"]
+            else:
+                num = data.select_dtypes(include=[np.number])
+                s = num.iloc[:, 0] if not num.empty else data.iloc[:, 0]
+            if isinstance(s, pd.DataFrame):
+                s = s.iloc[:, 0] if not s.empty else pd.Series(dtype=float)
+            s = pd.to_numeric(s, errors="coerce").dropna()
+            s.name = "price"
+            return s
+        elif isinstance(data, pd.Series):
+            if data.empty:
+                return pd.Series(dtype=float, name="price")
+            s = pd.to_numeric(data, errors="coerce").dropna()
+            s.name = "price"
+            return s
+        else:
+            try:
+                s = pd.Series(data) if not isinstance(data, pd.Series) else data
+                s = pd.to_numeric(s, errors="coerce").dropna()
+                s.name = "price"
+                return s
+            except Exception:
+                return pd.Series(dtype=float, name="price")
+    except Exception as e:
+        print(f"Error in load_prices for {ticker}: {e}")
+        return pd.Series(dtype=float, name="price")
+
+def pct_returns(prices: pd.Series) -> pd.Series:
+    """Return simple percentage returns as a Series."""
+    if isinstance(prices, pd.DataFrame):
+        prices = prices.iloc[:, 0]
+    prices = pd.to_numeric(prices, errors="coerce").dropna()
+    return prices.pct_change().dropna()
+
+def annualized_vol(returns: pd.Series, trading_days: int = 252) -> float:
+    """Annualized volatility as a float."""
+    if returns is None or (hasattr(returns, "empty") and returns.empty):
+        return float("nan")
+    if isinstance(returns, pd.DataFrame):
+        returns = returns.iloc[:, 0]
+    returns = pd.to_numeric(returns, errors="coerce").dropna()
+    if returns.empty:
+        return float("nan")
+    vol = returns.std(ddof=1) * math.sqrt(trading_days)
+    try:
+        return float(vol)
+    except Exception:
+        return float("nan")
+
+def max_drawdown(prices: pd.Series) -> float:
+    """Max drawdown as a float (0..1)."""
+    if prices is None or (hasattr(prices, "empty") and prices.empty):
+        return float("nan")
+    if isinstance(prices, pd.DataFrame):
+        prices = prices.iloc[:, 0]
+    prices = pd.to_numeric(prices, errors="coerce").dropna()
+    if prices.empty:
+        return float("nan")
+    roll_max = prices.cummax()
+    drawdowns = (roll_max - prices) / roll_max
+    try:
+        return float(drawdowns.max())
+    except Exception:
+        return float("nan")
+
+# -----------------------------
+# ---- OWNER EARNINGS ---------
+# -----------------------------
+@dataclass
+class FinancialRow:
+    net_income: float
+    depreciation_amortization: float
+    capex_total: float
+    sales: Optional[float] = None
+    ppe_net: Optional[float] = None
+    other_non_cash: float = 0.0
+    delta_working_capital: float = 0.0
+
+def maintenance_capex_simple(dep_amort: float) -> float:
+    return max(dep_amort, 0.0)
+
+def maintenance_capex_greenwald_from_hist(
+    sales_hist: List[float], ppe_hist: List[float], capex_hist: List[float]
+) -> Optional[float]:
+    """
+    Compute Greenwald maintenance CapEx from actual history:
+      - avg_ratio = sum(PPE)/sum(Sales) over N periods (N>=2)
+      - growth_capex_t ≈ avg_ratio * max(0, Sales_t - Sales_{t-1})
+      - maint_capex_t = CapEx_t − growth_capex_t
+    Returns None if insufficient data.
+    """
+    try:
+        if not (sales_hist and ppe_hist and capex_hist):
+            return None
+        n = min(len(sales_hist), len(ppe_hist), len(capex_hist))
+        if n < 2:
+            return None
+        sales_hist = sales_hist[-n:]
+        ppe_hist = ppe_hist[-n:]
+        capex_hist = capex_hist[-n:]
+        sum_sales = sum(x for x in sales_hist if x is not None)
+        sum_ppe = sum(x for x in ppe_hist if x is not None)
+        if sum_sales <= 0 or sum_ppe <= 0:
+            return None
+        avg_ratio = sum_ppe / max(sum_sales, 1e-9)
+        sales_t = sales_hist[-1] or 0.0
+        sales_prev = sales_hist[-2] or 0.0
+        growth_capex = max(avg_ratio * max(0.0, sales_t - sales_prev), 0.0)
+        maint = (capex_hist[-1] or 0.0) - growth_capex
+        return float(max(maint, 0.0))
+    except Exception:
+        return None
+
+def maintenance_capex_greenwald(history: List[FinancialRow]) -> float:
+    """Legacy variant for tests; keep compatibility."""
+    if len(history) < 2:
+        return maintenance_capex_simple(history[-1].depreciation_amortization)
+    sales = [x.sales for x in history if x.sales is not None]
+    ppe = [x.ppe_net for x in history if x.ppe_net is not None]
+    if len(sales) < 2 or len(ppe) < 2:
+        return maintenance_capex_simple(history[-1].depreciation_amortization)
+    avg_ratio = (sum(ppe) / max(sum(sales), 1e-9))
+    sales_t = history[-1].sales or 0.0
+    sales_prev = history[-2].sales or 0.0
+    growth_capex = max(avg_ratio * max(0.0, sales_t - sales_prev), 0.0)
+    maint = (history[-1].capex_total or 0.0) - growth_capex
+    return max(maint, 0.0)
+
+def owner_earnings(row: FinancialRow, maint_capex: float) -> float:
+    """Base Buffett (1986) without ΔWC penalty (kept for tests/backward-compat)."""
+    return (
+        (row.net_income or 0.0)
+        + (row.depreciation_amortization or 0.0)
+        + (row.other_non_cash or 0.0)
+        - max(maint_capex, 0.0)
+    )
+
+def owner_earnings_adjusted(
+    base_oe: float,
+    delta_wc: float,
+    include_wc: bool = True,
+    only_increases: bool = True,
+) -> float:
+    """
+    Optionally subtract ΔWC from Owner Earnings.
+    If only_increases=True, subtract max(ΔWC, 0).
+    """
+    if not include_wc:
+        return float(base_oe)
+    penalty = max(delta_wc, 0.0) if only_increases else float(delta_wc)
+    return float(base_oe - penalty)
+
+# -----------------------------
+# ---- LOOK-THROUGH EARNINGS ---
+# -----------------------------
+@dataclass
+class InvesteesEarnings:
+    name: str
+    ownership_pct: float
+    net_income: float
+    dividends_received: float = 0.0
+
+def look_through_earnings(
+    operating_earnings: float,
+    investees: List[InvesteesEarnings],
+    tax_rate_on_retained: float = 0.21,
+) -> float:
+    lt = operating_earnings
+    for iv in investees:
+        retained = max(iv.net_income - iv.dividends_received, 0.0)
+        lt += iv.ownership_pct * retained * (1.0 - tax_rate_on_retained)
+    return float(lt)
+
+# -----------------------------
+# ---- ALTMAN Z & RISK --------
+# -----------------------------
+def altman_z(
+    manufacturing: bool,
+    public: bool,
+    working_capital: float,
+    retained_earnings: float,
+    ebit: float,
+    equity_mkt_value: float,
+    total_assets: float,
+    sales: float,
+    total_liabilities: float,
+) -> Tuple[float, str]:
+    eps = 1e-9
+    X1 = (working_capital) / max(total_assets, eps)
+    X2 = (retained_earnings) / max(total_assets, eps)
+    X3 = (ebit) / max(total_assets, eps)
+    X4 = (equity_mkt_value if public else max(equity_mkt_value, eps)) / max(total_liabilities, eps)
+    X5 = (sales) / max(total_assets, eps)
+    if manufacturing and public:
+        z = 1.2 * X1 + 1.4 * X2 + 3.3 * X3 + 0.6 * X4 + 1.0 * X5
+        zone = "Distress" if z < 1.81 else ("Gray" if z < 2.99 else "Safe")
+    else:
+        z = 6.56 * X1 + 3.26 * X2 + 6.72 * X3 + 1.05 * X4
+        zone = "Distress" if z < 1.1 else ("Gray" if z < 2.6 else "Safe")
+    return float(z), zone
+
+def capital_preservation_score(
+    z_value: float,
+    zone: str,
+    mdd: float,
+    ann_vol: float,
+    w_z: float = 0.5,
+    w_mdd: float = 0.3,
+    w_vol: float = 0.2,
+) -> float:
+    base = {"Distress": 0.2, "Gray": 0.6, "Safe": 0.9}.get(zone, 0.5)
+    try:
+        z_val = float(z_value)
+    except Exception:
+        z_val = 0.0
+    z_norm = min(1.0, base * (1.0 + 0.05 * max(z_val, 0.0)))
+    try:
+        mdd_val = float(mdd)
+    except Exception:
+        mdd_val = float("nan")
+    try:
+        vol_val = float(ann_vol)
+    except Exception:
+        vol_val = float("nan")
+    if math.isnan(mdd_val):
+        mdd_val = 0.5
+    if math.isnan(vol_val):
+        vol_val = 0.3
+    mdd_norm = max(0.0, 1.0 - min(mdd_val, 0.8))
+    vol_norm = max(0.0, 1.0 - min(vol_val, 0.8))
+    score = w_z * z_norm + w_mdd * mdd_norm + w_vol * vol_norm
+    return float(max(0.0, min(score, 1.0)))
+
+# -----------------------------
+# ---- CONTRARIAN OVERLAY -----
+# -----------------------------
+def contrarian_overlay(sentiment_inputs: Dict[str, Optional[float]]) -> float:
+    fg = sentiment_inputs.get("fear_greed_index")
+    si = sentiment_inputs.get("short_interest_pct_of_float")
+    ns = sentiment_inputs.get("news_sentiment")
+    pcr = sentiment_inputs.get("put_call_ratio")
+    boost = 1.0
+    if fg is not None and fg < 30: boost += 0.05
+    if si is not None and si >= 0.08: boost += 0.04
+    if ns is not None and ns <= -0.3: boost += 0.03
+    if pcr is not None and pcr > 1.0: boost += 0.03
+    return float(np.clip(boost, 0.90, 1.15))
+
+# -----------------------------
+# ---- CIRCLE OF COMPETENCE ----
+# -----------------------------
+def circle_of_competence_pass(
+    sector: str,
+    industry: str,
+    whitelist: List[str],
+    blacklist: List[str],
+    complexity_flags: List[str],
+) -> bool:
+    s = (sector or "").strip().lower()
+    i = (industry or "").strip().lower()
+    wl = {x.strip().lower() for x in (whitelist or [])}
+    bl = {x.strip().lower() for x in (blacklist or [])}
+    flags = {x.strip().lower() for x in (complexity_flags or [])}
+    if s in bl or i in bl: return False
+    if wl and (s not in wl and i not in wl): return False
+    if any(flag in flags for flag in ["pre-revenue", "binary-fda", "exploration-only", "crypto-miner"]): return False
+    return True
+
+# -----------------------------
+# ---- STATE & CALLBACKS -------
+# -----------------------------
+DEFAULTS = {
+    "inp_ticker": "KO",
+    "inp_sector": "Consumer Staples",
+    "inp_industry": "Beverages - Non-Alcoholic",
+    "inp_net_income": 9500.0,
+    "inp_da": 1800.0,
+    "inp_capex": 1500.0,
+    "inp_sales": 44000.0,
+    "inp_ppe": 10000.0,
+    "inp_wc": 6000.0,
+    "inp_re": 38000.0,
+    "inp_ebit": 12000.0,
+    "inp_eq_mkt": 260000.0,
+    "inp_ta": 95000.0,
+    "inp_tl": 52000.0,
+    "inp_investee_json": '[{"name":"BottlerCo","ownership_pct":0.25,"net_income":800,"dividends_received":300}]',
+    "inp_fg": 50,
+    "inp_si": 0.0,
+    "inp_ns": 0.0,
+    "inp_pcr": 0.9,
+    # ΔWC controls
+    "inp_include_wc": True,
+    "inp_wc_only_inc": True,
+    "inp_delta_wc": 0.0,   # auto-filled from last two quarters if available
+}
+
+def init_defaults():
+    for k, v in DEFAULTS.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+def fetch_and_fill_from_yahoo():
+    """Callback for the Fetch button—safe to mutate session_state before widgets render next run."""
+    ticker = st.session_state.get("inp_ticker", "KO")
+    prof = fetch_profile(ticker)
+    if prof.get("sector"): st.session_state["inp_sector"] = prof["sector"]
+    if prof.get("industry"): st.session_state["inp_industry"] = prof["industry"]
+
+    funda = fetch_fundamentals(ticker)
+
+    def _maybe(target_key: str, val):
+        if val is None: return
+        if isinstance(val, float) and math.isnan(val): return
+        st.session_state[target_key] = float(val)
+
+    _maybe("inp_net_income", funda.get("net_income"))
+    _maybe("inp_ebit", funda.get("ebit"))
+    _maybe("inp_da", funda.get("depreciation"))
+    _maybe("inp_capex", funda.get("capex_total"))
+    _maybe("inp_sales", funda.get("sales"))
+    _maybe("inp_ta", funda.get("total_assets"))
+    _maybe("inp_tl", funda.get("total_liabilities"))
+    _maybe("inp_re", funda.get("retained_earnings"))
+    _maybe("inp_wc", funda.get("working_capital"))
+    _maybe("inp_ppe", funda.get("ppe_net"))
+
+    # Δ Working Capital (quarterly latest change)
+    wc_series = fetch_working_capital_quarterly(ticker)  # newest last
+    if wc_series and len(wc_series) >= 2:
+        st.session_state["inp_delta_wc"] = float((wc_series[-1] or 0.0) - (wc_series[-2] or 0.0))
+
+    # Preload Greenwald history for the next render
+    gh = fetch_greenwald_history(ticker)
+    st.session_state["__greenwald_hist"] = gh  # dict with 'sales', 'ppe_net', 'capex'
+
+    mc = fetch_market_cap(ticker)
+    if mc is not None and not (isinstance(mc, float) and math.isnan(mc)):
+        st.session_state["inp_eq_mkt"] = float(mc)
+
+    st.session_state["__fetched_ok"] = True  # show toast once
+
+# -----------------------------
+# -------- STREAMLIT UI -------
+# -----------------------------
+def _flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.columns, pd.MultiIndex):
+        try:
+            df = df.copy()
+            df.columns = df.columns.get_level_values(-1)
+        except Exception:
+            df.columns = [str(c) for c in df.columns]
+    return df
+
+def _pick_price_series(df: pd.DataFrame):
+    if df is None or df.empty:
+        return None
+    df = _flatten_columns(df.copy())
+    cols = [str(c).strip() for c in df.columns]
+    norm = {c.lower().replace(" ","").replace("_",""): c for c in cols}
+    # Prefer Close/price-like fields, exclude volume-like
+    for key in ["close","adjclose","regularmarketprice","price","last","c"]:
+        if key in norm:
+            s = pd.to_numeric(df[norm[key]], errors="coerce").dropna()
+            if not s.empty:
+                return s
+    num = df.select_dtypes(include=["number"])
+    if not num.empty:
+        vol_like = {"volume","vol","volumes","regularmarketvolume","totalvolume"}
+        keep_cols = [c for c in num.columns if str(c).strip().lower() not in vol_like]
+        if keep_cols:
+            s = pd.to_numeric(num[keep_cols].iloc[:, -1], errors="coerce").dropna()
+            if not s.empty:
+                return s
+    return None
+
+def main():
+    st.set_page_config(page_title="Buffett Analyzer — Extended", layout="wide")
+    # --- Authentication gate (must be signed in before anything renders) ---
+    if not AUTH_AVAILABLE:
+        st.error('Authentication is required but not configured. Set GOOGLE_* env vars and restart.')
+        st.stop()
+    require_auth()  # Renders Google sign-in if needed and stops the app until authenticated
+    # --- End authentication gate ---
+    init_defaults()  # MUST run before any widgets are created
+
+    # --- Account / Authentication (sidebar) ---
+    with st.sidebar:
+        st.header("Account")
+        if AUTH_AVAILABLE:
+            # Single source of truth: all sign-in/out UI lives in auth_manager.render_auth_ui
+            render_auth_ui()
+        else:
+            st.info("Auth not configured; running in open mode.")
+
+    # Initialize ChatGPT integration
+    if "chatgpt_integration" not in st.session_state:
+        st.session_state["chatgpt_integration"] = ChatGPTIntegration()
+    chat_integration = st.session_state["chatgpt_integration"]
+
+    # Make debug flag available to the modal (modal will ignore unless implemented there)
+    st.session_state.setdefault("__chatgpt_debug", SHOW_CHATGPT_DEBUG)
+
+    # Ensure ChatGPT shows automatically on first load
+    if "show_chatgpt_modal" not in st.session_state:
+        st.session_state["show_chatgpt_modal"] = True
+
+    st.title("Buffett Analyzer")
+
+    # Show success toast once after a fetch
+    if st.session_state.pop("__fetched_ok", False):
+        st.success("Auto-filled latest available fundamentals from Yahoo.")
+
+    with st.sidebar:
+        st.header("Circle of Competence", help=H("circle_of_competence"))
+        user_whitelist = st.multiselect(
+            "Whitelisted sectors/industries",
+            ["Consumer Staples","Consumer Discretionary","Financials","Healthcare","Industrials","Energy","Utilities","Tech/Platforms","REITs","Materials","Telecom"],
+            default=[],
+            help=H("whitelist"),
+        )
+        user_blacklist = st.multiselect(
+            "Blacklisted sectors/industries",
+            ["Biotech (pre-revenue)","Exploration/Mining","Crypto miners","SPACs","Highly cyclical"],
+            default=[],
+            help=H("blacklist"),
+        )
+
+        st.header("Owner Earnings Settings", help=H("owner_earnings"))
+        maint_method = st.radio(
+            "Maintenance CapEx method",
+            ["≈ Depreciation (simple)", "Greenwald PPE/Sales (5y)"],
+            help=H("maint_capex_method"),
+        )
+        # ΔWC controls
+        st.checkbox("Include Δ Working Capital in OE (only increases)", key="inp_include_wc", help=H("delta_wc"))
+        st.toggle("ΔWC: penalize only increases (on)", key="inp_wc_only_inc")
+        st.caption("If enabled, OE_adj = OE − max(ΔWC, 0).")
+
+        st.header("Risk Weights", help=H("weights_section"))
+        w_z = st.slider("Weight: Altman Z", 0.0, 1.0, 0.5, 0.05, help=H("w_z"))
+        w_mdd = st.slider("Weight: Max Drawdown (invert)", 0.0, 1.0, 0.3, 0.05, help=H("w_mdd"))
+        w_vol = st.slider("Weight: Annualized Volatility (invert)", 0.0, 1.0, 0.2, 0.05, help=H("w_vol"))
+        st.caption("Weights auto-normalize in the scoring function.")
+
+        st.header("Contrarian Overlay (optional)", help=H("contrarian"))
+        st.number_input("Fear & Greed Index (0..100)", min_value=0, max_value=100, key="inp_fg", help=H("fear_greed"))
+        st.number_input("Short interest (% of float, e.g., 0.08 = 8%)", min_value=0.0, max_value=1.0, step=0.01, format="%.2f", key="inp_si", help=H("short_interest"))
+        st.slider("News sentiment (−1..+1)", -1.0, 1.0, value=float(st.session_state.get("inp_ns", 0.0)), step=0.05, key="inp_ns", help=H("news_sentiment"))
+        st.number_input("Put/Call Ratio", min_value=0.0, max_value=5.0, step=0.1, key="inp_pcr", help=H("put_call"))
+
+        with st.expander("Glossary"):
+            for k, v in GLOSSARY.items():
+                st.markdown(f"- **{k.replace('_',' ').title()}** — {v}")
+
+    colL, colR = st.columns([1.2, 1.0])
+
+    # ---------- Left column ----------
+    with colL:
+        st.subheader("Inputs")
+
+        st.button("Fetch fundamentals from Yahoo", on_click=fetch_and_fill_from_yahoo)
+
+        render_data_quality_flags()
+
+        ticker = st.text_input("Ticker", key="inp_ticker", help=H("ticker"), on_change=fetch_and_fill_from_yahoo) # Auto fetch on change
+        # -- live suggestions as user types --
+        q = str(st.session_state.get("inp_ticker") or "").strip()
+        if len(q) >= 2:
+            sugg = search_symbols(q, limit=8)
+            if not sugg.empty:
+                with st.container():
+                    st.caption("Suggestions")
+                    for idx, row in sugg.reset_index(drop=True).iterrows():
+                        label = f"{row['ticker']} — {row['name']}"
+                        key = f"suggest_{row['ticker']}_{row.get('exchange','')}_{idx}"
+                        if st.button(label, key=key, help=row.get("exchange", "")):
+                            st.session_state["inp_ticker"] = str(row["ticker"])
+                            try:
+                                fetch_and_fill_from_yahoo()
+                            except Exception as e:
+                                st.warning(f"Auto-fetch failed for {row['ticker']}: {e}")
+                            st.rerun()
+        sector = st.text_input("Sector (manual or from your DB)", key="inp_sector", help=H("sector"))
+        industry = st.text_input("Industry (manual or from your DB)", key="inp_industry", help=H("industry"))
+
+        st.markdown("**Financials (TTM or Last FY)**")
+        net_income = money_number_input("Net Income", key="inp_net_income", step=100.0, help=H("net_income"))
+        da         = money_number_input("Depreciation & Amortization", key="inp_da", step=50.0, help=H("da"))
+        capex      = money_number_input("Total CapEx", key="inp_capex", step=50.0, help=H("capex_total"))
+        sales      = money_number_input("Sales / Revenue", key="inp_sales", step=100.0, help=H("sales"))
+        ppe        = money_number_input("Net PP&E", key="inp_ppe", step=100.0, help=H("ppe"))
+
+        st.markdown("**Balance Sheet (for Z-Score)**")
+        wc     = money_number_input("Working Capital", key="inp_wc", step=100.0, help=H("working_capital"))
+        re     = money_number_input("Retained Earnings (BS)", key="inp_re", step=100.0, help=H("retained_earnings"))
+        ebit   = money_number_input("EBIT", key="inp_ebit", step=100.0, help=H("ebit"))
+        eq_mkt = money_number_input("Equity Market Value (or Book Equ., private)", key="inp_eq_mkt", step=1000.0, help=H("equity_mkt_value"))
+        ta     = money_number_input("Total Assets", key="inp_ta", step=500.0, help=H("total_assets"))
+        tl     = money_number_input("Total Liabilities", key="inp_tl", step=500.0, help=H("total_liabilities"))
+
+        st.markdown("**Investee (Look-Through) — optional**")
+        investee_json = st.text_area(
+            "Enter list of investees as JSON (name, ownership_pct, net_income, dividends_received)",
+            key="inp_investee_json",
+            help=H("investee_json"),
+        )
+
+    # ---------- Right column ----------
+    with colR:
+        st.subheader("Process")
+
+        inside_coc = circle_of_competence_pass(
+            sector, industry,
+            whitelist=user_whitelist,
+            blacklist=[x.lower() for x in user_blacklist],
+            complexity_flags=[x.lower() for x in user_blacklist],
+        )
+        coc_color = "green" if inside_coc else "red"
+        coc_label = f"<span style='color:{coc_color};font-weight:bold'>{'PASS' if inside_coc else 'FAIL'}</span>"
+        st.markdown(f"Circle of Competence: {coc_label}", unsafe_allow_html=True)
+
+        intraday = _as_df(fetch_intraday_1m(ticker))
+
+        s_close = None
+        try:
+            if isinstance(intraday, pd.DataFrame):
+                s_close = _pick_price_series(intraday)
+            elif isinstance(intraday, pd.Series):
+                s = pd.to_numeric(intraday, errors="coerce").dropna(); s_close = s if not s.empty else None
+            elif isinstance(intraday, (list, tuple, np.ndarray)):
+                s = pd.to_numeric(pd.Series(np.asarray(intraday).ravel()), errors="coerce").dropna(); s_close = s if not s.empty else None
+            elif isinstance(intraday, dict):
+                for k in ("Close","close","adj close","adj_close","adjclose","regularMarketPrice","price","last","c"):
+                    if k in intraday:
+                        s = pd.to_numeric(pd.Series(intraday[k]), errors="coerce").dropna()
+                        if not s.empty:
+                            s_close = s; break
+        except Exception as e:
+            st.info(f"Intraday parsing error: {e}")
+
+        if s_close is not None and not s_close.empty:
+            try:
+                last_px = float(s_close.iloc[-1])
+                # Relative sanity check vs last daily close
+                ok_to_show = True
+                try:
+                    recent = load_prices(ticker)
+                    if hasattr(recent, 'empty') and not recent.empty:
+                        ref = float(recent.dropna().iloc[-1])
+                        if ref > 0 and (last_px > 5*ref or last_px < 0.2*ref):
+                            ok_to_show = False
+                except Exception:
+                    pass
+                if ok_to_show:
+                    st.metric("Latest Price (1m)", fmt_money_price(last_px))
+            except Exception as e:
+                st.info(f"Intraday parsing error: {e}")
+
+        if maint_method.startswith("≈ Dep"):
+            maint_capex = maintenance_capex_simple(da)
+            maint_help = H("maint_dep_simple")
+        else:
+            gh = st.session_state.get("__greenwald_hist") or fetch_greenwald_history(ticker)
+            maint_g = maintenance_capex_greenwald_from_hist(
+                gh.get("sales") or [], gh.get("ppe_net") or [], gh.get("capex") or []
+            )
+            if maint_g is None:
+                maint_capex = maintenance_capex_simple(da)
+                maint_help = H("maint_greenwald") + "  \n*Insufficient history; fell back to ≈ D&A.*"
+            else:
+                maint_capex = maint_g
+                maint_help = H("maint_greenwald")
+        st.metric("Maintenance CapEx (est.)", fmt_money_short(maint_capex), help=maint_help)
+
+        row_now = FinancialRow(
+            net_income=float(net_income),
+            depreciation_amortization=float(da),
+            capex_total=float(capex),
+            sales=float(sales),
+            ppe_net=float(ppe),
+        )
+        oe_base = owner_earnings(row_now, maint_capex)
+
+        delta_wc = float(st.session_state.get("inp_delta_wc", 0.0))
+        st.metric("Δ Working Capital (latest qtr)", fmt_money_short(delta_wc), help=H("delta_wc"))
+
+        oe_final = owner_earnings_adjusted(
+            base_oe=oe_base,
+            delta_wc=delta_wc,
+            include_wc=bool(st.session_state.get("inp_include_wc", True)),
+            only_increases=bool(st.session_state.get("inp_wc_only_inc", True)),
+        )
+        st.metric("Owner Earnings (Buffett 1986)", fmt_money_short(oe_final), help=H("owner_earnings"))
+
+        try:
+            raw = investee_json
+            items = json.loads(raw) if isinstance(raw, str) else (raw or [])
+            investees = []
+            for it in items:
+                try:
+                    investees.append(
+                        InvesteesEarnings(
+                            name=str(it.get("name","")),
+                            ownership_pct=float(it.get("ownership_pct", 0.0) or 0.0),
+                            net_income=float(it.get("net_income", 0.0) or 0.0),
+                            dividends_received=float(it.get("dividends_received", 0.0) or 0.0),
+                        )
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            investees = []
+        lt = look_through_earnings(operating_earnings=float(oe_final), investees=investees)
+        st.metric("Look-Through Earnings (Buffett 1991)", fmt_money_short(lt))
+
+        manufacturing = st.toggle("Manufacturing?", value=False)
+        public = st.toggle("Public company?", value=True)
+        z, zone = altman_z(manufacturing, public, wc, re, ebit, eq_mkt, ta, sales, tl)
+        zone_color = {"Safe": "green", "Gray": "orange", "Distress": "red"}.get(zone, "gray")
+        zone_label = f"<span style='color:{zone_color};font-weight:bold'>{zone}</span>"
+        st.markdown(f"Altman Z: <b>{z:.2f}</b> ({zone_label})", unsafe_allow_html=True)
+
+        prices = load_prices(ticker)
+        if not prices.empty:
+            mdd = max_drawdown(prices)
+            vol = annualized_vol(pct_returns(prices))
+        else:
+            mdd, vol = float("nan"), float("nan")
+        st.metric("Max Drawdown (10y)", fmt_pct(mdd), help=H("max_drawdown"))
+        st.metric("Annualized Volatility (10y)", fmt_pct(vol), help=H("volatility"))
+
+        score_cprs = capital_preservation_score(z, zone, mdd, vol, w_z=w_z, w_mdd=w_mdd, w_vol=w_vol)
+        st.markdown("**Capital Preservation Score**")
+        st.progress(score_cprs)
+        st.metric("Capital Preservation Score", f"{score_cprs * 100:.1f}/100", help=H("capital_preservation"))
+
+        mult = contrarian_overlay({
+            "fear_greed_index": st.session_state.get("inp_fg", 50),
+            "short_interest_pct_of_float": st.session_state.get("inp_si", 0.0),
+            "news_sentiment": st.session_state.get("inp_ns", 0.0),
+            "put_call_ratio": st.session_state.get("inp_pcr", 0.9),
+        })
+        st.metric("Contrarian Overlay (multiplier)", f"x{mult:.3f}", help=H("contrarian"))
+
+        oe_ratio = np.clip(oe_final / sales, -1.0, 1.0) if sales > 0 else 0.0
+
+        if "lt" not in locals():
+            lt = float(oe_final)
+
+        lt_ratio = np.clip(lt / max(sales, 1e-9), -1.0, 1.0)
+
+        base = (
+            0.35 * (1.0 if inside_coc else 0.0)
+            + 0.25 * ((oe_ratio + 1) / 2)
+            + 0.30 * score_cprs
+            + 0.10 * ((lt_ratio + 1) / 2)
+        )
+        buffett_score = float(np.clip(base * 100.0 * mult, 0.0, 100.0))
+
+        st.markdown("**Buffett Score**")
+        st.progress(buffett_score / 100.0)
+        st.success(f"Buffett Score (illustrative): **{buffett_score:.1f}/100**", icon="✅")
+
+        with st.expander("📊 Buffett Score Breakdown"):
+            w_coc = 0.35
+            w_oe  = 0.25
+            w_cpr = 0.30
+            w_lt  = 0.10
+
+            coc_raw = 1.0 if inside_coc else 0.0
+            oe_raw  = (oe_ratio + 1) / 2
+            cpr_raw = float(score_cprs)
+            lt_raw  = (lt_ratio + 1) / 2
+
+            coc_w = w_coc * coc_raw
+            oe_w  = w_oe  * oe_raw
+            cpr_w = w_cpr * cpr_raw
+            lt_w  = w_lt  * lt_raw
+
+            base_points = (coc_w + oe_w + cpr_w + lt_w) * 100.0
+            final_points = float(np.clip(base_points * mult, 0.0, 100.0))
+            contrarian_lift_total = final_points - min(100.0, base_points)
+
+            rows = []
+            for name, w, raw, w_contrib in [
+                ("Circle of Competence", w_coc, coc_raw, coc_w),
+                ("Owner Earnings Ratio", w_oe,  oe_raw,  oe_w),
+                ("Capital Preservation",  w_cpr, cpr_raw, cpr_w),
+                ("Look-Through Ratio",   w_lt,  lt_raw,  lt_w),
+            ]:
+                contrib_pts = w_contrib * 100.0
+                lift_pts = (mult - 1.0) * contrib_pts
+                rows.append({
+                    "Component": name,
+                    "Raw Weight": f"{w:.2f}",
+                    "Raw Score (0–1)": f"{raw:.3f}",
+                    "Contribution (pts)": f"{contrib_pts:.2f}",
+                    "Contrarian Lift (pp)": f"{lift_pts:+.2f}",
+                })
+
+            df_break = pd.DataFrame(rows)
+            st.table(df_break)
+
+            st.markdown("---")
+            st.write(f"**Base (pre-contrarian):** `{base_points:.2f} / 100`")
+            st.write(f"**Contrarian multiplier:** `x{mult:.3f}` → **total lift:** `{contrarian_lift_total:+.2f} pts`")
+            st.write(f"**Final Buffett Score:** `{final_points:.2f} / 100`")
+
+            with st.expander("🔎 Capital Preservation internals (informational)") as _:
+                base_zone = {"Distress": 0.2, "Gray": 0.6, "Safe": 0.9}.get(zone, 0.5)
+                z_norm_disp = min(1.0, base_zone * (1.0 + 0.05 * max(z, 0.0)))
+                mdd_val = mdd if not math.isnan(mdd) else 0.5
+                vol_val = vol if not math.isnan(vol) else 0.3
+                mdd_norm_disp = max(0.0, 1.0 - min(mdd_val, 0.8))
+                vol_norm_disp = max(0.0, 1.0 - min(vol_val, 0.8))
+                st.write(f"- **Altman Z normalized:** `{z_norm_disp:.3f}` (zone: {zone}) — weight in CPRS: `{w_z:.2f}`")
+                st.write(f"- **(1 − Max Drawdown):** `{mdd_norm_disp:.3f}` — weight in CPRS: `{w_mdd:.2f}`")
+                st.write(f"- **(1 − Volatility):** `{vol_norm_disp:.3f}` — weight in CPRS: `{w_vol:.2f}`")
+                st.write(f"- **Capital Preservation (0–1):** `{score_cprs:.3f}`")
+
+        st.markdown("**Owner Earnings Ratio (Owner Earnings / Sales)**")
+        st.progress((oe_ratio + 1) / 2)
+        st.metric("Owner Earnings Ratio", fmt_pct(oe_ratio), help="Owner Earnings as % of Sales")
+
+        if (not math.isnan(mdd) and mdd > 0.7) or (z < 1.1):
+            st.warning("Caution: very high drawdown history and/or low Altman Z detected. Investigate solvency/liquidity risk.")
+
+        if st.button("Export Report to PDF"):
+            metrics = {
+                "Owner Earnings": fmt_money_short(oe_final),
+                "Look-Through Earnings": fmt_money_short(lt),
+                "Altman Z": f"{z:.2f} ({zone})",
+                "Max Drawdown": fmt_pct(mdd),
+                "Volatility": fmt_pct(vol),
+                "Capital Preservation": f"{score_cprs * 100:.1f}/100",
+            }
+            pdf_file = export_pdf(f"{ticker}_report.pdf", ticker, buffett_score, metrics)
+            st.success(f"Exported to {pdf_file}")
+            with open(pdf_file, "rb") as f:
+                st.download_button("Download PDF", f, file_name=f"{ticker}_report.pdf", mime="application/pdf")
+
+    # ---- Compile company data for ChatGPT context ----
+    company_data = get_current_company_data(
+        ticker=ticker,
+        oe_final=oe_final,
+        lt=lt,
+        z=z,
+        zone=zone,
+        score_cprs=score_cprs,
+        buffett_score=buffett_score,
+        net_income=net_income,
+        sales=sales
+    )
+
+    # ---- Auto-render ChatGPT modal at the bottom ----
+    render_chatgpt_modal(chat_integration, ticker, company_data)
+
+    # ---- Notes ----
+    st.caption("""
+    **Notes**  
+    • Owner Earnings per Buffett (1986): NI + D&A (+non-cash) − Maintenance CapEx (optionally adjust for ΔWC).  
+    • Look-Through Earnings per Buffett (1991): add retained earnings of investees pro-rata (after tax).  
+    • Capital Preservation blends Altman Z (or Z'), Max Drawdown, and volatility.  
+    • Contrarian overlay is optional and user-weighted.  
+    • Yahoo fundamentals are best-effort; validate before making decisions.
+    """)
+
+if __name__ == "__main__":
+    main()
